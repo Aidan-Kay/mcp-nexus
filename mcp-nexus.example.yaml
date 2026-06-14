@@ -1,0 +1,31 @@
+port: 8050
+
+auth:
+  enabled: false # Set to true and provide a token in production
+  token: ""
+  allowedOrigins: # Optional — restrict CORS to these origins when auth is on
+    - https://openwebui.local
+
+connectors:
+  httpReuseIdleTimeoutSeconds: 300 # Reap idle upstream HTTP sessions after N seconds
+  recoveryIntervalSeconds: 30 # Probe failed sources every N seconds (0 = disabled)
+
+sources:
+  - id: todoist
+    name: Todoist
+    description: Task and project management
+    transport: http
+    url: http://todoist-mcp:8081/mcp
+    filter: ["*"] # Glob patterns — only index matching tools
+
+  - id: outlook
+    name: Outlook
+    description: Email and calendar
+    transport: stdio
+    command: npx
+    args: ["-y", "@softeria/ms-365-mcp-server"]
+    env:
+      API_KEY: "your-key"
+    preloadedTools:
+      - search-emails
+      - list-folders
