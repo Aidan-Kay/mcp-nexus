@@ -1,13 +1,20 @@
 # ─── Build Stage ───────────────────────────────────────────────────────────────
 FROM node:22-slim AS builder
 
+# git + ca-certificates are required to fetch the repository over HTTPS
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-COPY package.json tsconfig.json ./
-RUN npm install --ignore-scripts
+# Clone the repository (shallow clone — no history needed)
+RUN git clone --depth 1 https://github.com/Aidan-Kay/mcp-nexus.git .
 
-COPY src/ ./src/
+RUN npm install
 RUN npx tsc
+# Prune dev dependencies so runtime only has production deps (with native binaries intact)
+RUN npm prune --omit=dev
 
 # ─── Runtime Stage ────────────────────────────────────────────────────────────
 FROM node:22-slim AS runtime
@@ -22,11 +29,13 @@ RUN apt-get update && \
 # Create non-root user
 RUN groupadd -r nexus && useradd -r -g nexus nexus
 
-COPY package.json ./
-RUN npm install --omit=dev --ignore-scripts && \
-    npm cache clean --force
+COPY --from=builder /app/package.json /app/package-lock.json ./
+COPY --from=builder /app/node_modules/ ./node_modules/
 
 COPY --from=builder /app/dist/ ./dist/
+
+# Create data directory for model cache (writable by nexus user)
+RUN mkdir -p /app/data/model-cache && chown -R nexus:nexus /app/data
 
 # Volume for caching downloaded embedding models (built-in provider)
 VOLUME ["/app/data/model-cache"]
