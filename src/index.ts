@@ -12,6 +12,7 @@ import { buildIndex } from "./indexer.js";
 import { logger, setLogLevel } from "./logger.js";
 import { NexusServer } from "./nexus-server.js";
 import { startRecovery, stopRecovery } from "./recovery.js";
+import { createEmbeddingProvider, generateToolEmbeddings, getEmbeddingIndex, SearchEngine } from "./search/index.js";
 import { configureHttpConnector, shutdownHttp } from "./sources/http-source.js";
 import { killAll } from "./sources/stdio-source.js";
 
@@ -67,8 +68,31 @@ async function main(): Promise<void> {
   logger.info("Indexing upstream MCP sources...");
   const index = await buildIndex(config.sources);
 
+  // 2b. Initialize search engine (lexical or semantic)
+  let searchEngine: SearchEngine;
+  let embeddingProvider = undefined;
+  if (config.search.type === "semantic" && config.search.semantic) {
+    logger.info(`Initializing semantic search (provider: ${config.search.semantic.provider})...`);
+    try {
+      embeddingProvider = await createEmbeddingProvider(config.search);
+      const embeddingIndex = getEmbeddingIndex(embeddingProvider!);
+      if (embeddingIndex) {
+        await generateToolEmbeddings(index, embeddingProvider!, embeddingIndex, config.search.semantic.batchSize);
+      }
+      searchEngine = new SearchEngine(config.search, index, embeddingProvider);
+      searchEngine.setEmbeddingIndex(embeddingIndex!);
+      logger.info("Semantic search initialized");
+    } catch (err) {
+      logger.error(`Failed to initialize semantic search: ${err instanceof Error ? err.message : String(err)}`);
+      logger.warn("Falling back to lexical search");
+      searchEngine = new SearchEngine(config.search, index);
+    }
+  } else {
+    searchEngine = new SearchEngine(config.search, index);
+  }
+
   // 3. Start the nexus server
-  const server = new NexusServer(config, index);
+  const server = new NexusServer(config, index, searchEngine);
 
   // 3b. Resolve preloaded tools from the completed index
   server.resolvePreloadedTools();

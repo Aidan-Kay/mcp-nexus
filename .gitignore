@@ -1,4 +1,5 @@
 node_modules
 dist
+md
 *.yaml
 !mcp-nexus.example.yaml

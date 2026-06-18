@@ -1,6 +1,7 @@
 /** Core types for mcp-nexus */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { SearchConfig } from "./search/types.js";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -8,6 +9,7 @@ export interface NexusConfig {
   port: number;
   auth: AuthConfig;
   connectors: ConnectorsConfig;
+  search: SearchConfig;
   sources: SourceConfig[];
 }
 
@@ -25,14 +27,12 @@ export interface ConnectorsConfig {
   recoveryIntervalSeconds: number;
 }
 
-export type SourceType = "gateway" | "server";
 export type TransportType = "http" | "stdio";
 
 export interface SourceConfig {
   id: string;
   name: string;
   description: string;
-  type: SourceType;
   transport: TransportType;
   /** HTTP URL (required for http transport) */
   url?: string;
@@ -48,6 +48,8 @@ export interface SourceConfig {
   env?: Record<string, string>;
   /** Non-prefixed tool names (e.g. "get-task") to surface directly in tools/list */
   preloadedTools?: string[];
+  /** Per-source request timeout in milliseconds (default: 15000) */
+  requestTimeoutMs?: number;
 }
 
 // ─── Runtime State ──────────────────────────────────────────────────────────
@@ -82,12 +84,40 @@ export interface NexusIndex {
   tools: Map<string, IndexedTool>;
   /** Pre-indexed tools grouped by sourceId — O(1) lookup for browse_tools */
   toolsBySource: Map<string, IndexedTool[]>;
+  /** Set of source IDs that have a lastError — O(1) lookup for recovery poller */
+  failedSources: Set<string>;
+  /** Tool embeddings for semantic search (namespacedName → vector) */
+  embeddings?: Map<string, Float32Array>;
 }
 
 export interface IndexedTool {
   sourceId: string;
   namespacedName: string;
   tool: Tool;
+}
+
+// ─── JSON-RPC Types (shared between http-source and stdio-source) ────────────
+
+export interface JsonRpcRequest {
+  jsonrpc: "2.0";
+  id?: string;
+  method: string;
+  params?: Record<string, unknown>;
+}
+
+export interface JsonRpcResponse {
+  jsonrpc: "2.0";
+  id: string;
+  result?: unknown;
+  error?: { code: number; message: string; data?: unknown };
+}
+
+// ─── Upstream Call Result (consistent return type for callTool) ─────────────
+
+export interface UpstreamCallResult {
+  content: unknown;
+  isError?: boolean;
+  error?: string;
 }
 
 // ─── Error Wrapping ─────────────────────────────────────────────────────────

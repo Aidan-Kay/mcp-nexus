@@ -4,16 +4,19 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js";
 import type { CallToolResult, Tool as McpTool } from "@modelcontextprotocol/sdk/types.js";
-import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { DEFAULT_NEGOTIATED_PROTOCOL_VERSION, isInitializeRequest, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID, timingSafeEqual } from "node:crypto";
+
 import { readFileSync } from "node:fs";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { updateSourceInIndex } from "./indexer.js";
 import { logger } from "./logger.js";
 import { namespaceTool, parseNamespacedName } from "./namespace.js";
-import type { IndexedTool, NexusConfig, NexusIndex } from "./types.js";
+import type { SearchEngine } from "./search/index.js";
+import type { NexusConfig, NexusIndex, UpstreamCallResult } from "./types.js";
 
 // Transport-specific callers
 import { callTool as httpCallTool, fetchTools as httpFetchTools } from "./sources/http-source.js";
@@ -24,46 +27,117 @@ const __dirname = dirname(__filename);
 const pkg = JSON.parse(readFileSync(resolve(__dirname, "../package.json"), "utf-8")) as { version: string };
 const SERVER_VERSION = pkg.version;
 
+/**
+ * Protocol version sent in the `mcp-protocol-version` response header.
+ * The SDK validates the *request* header but does not set it on responses,
+ * so we inject it via the response wrapper below.
+ * Uses the SDK's own default negotiated version to stay in sync.
+ */
+const MCP_PROTOCOL_VERSION = DEFAULT_NEGOTIATED_PROTOCOL_VERSION;
+
+/**
+ * Sends a JSON-RPC error response with the mcp-protocol-version header.
+ * Used for pre-transport errors (auth, body size, parse) that bypass the SDK.
+ */
+function sendJsonRpcError(res: ServerResponse, statusCode: number, code: number, message: string): void {
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json",
+    "mcp-protocol-version": MCP_PROTOCOL_VERSION,
+  });
+  res.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id: null }));
+}
+
+// ─── Protocol Version Response Header ──────────────────────────────────────
+//
+// The SDK transport validates the `mcp-protocol-version` *request* header but
+// never sets it on *responses*. The spec requires it on all POST responses.
+// The transport delegates to @hono/node-server, which calls
+// `outgoing.writeHead(status, headerRecord)` as its primary response path
+// (and `flushHeaders()` for unbuffered SSE streams). We monkey-patch just
+// those two methods to inject the header, forwarding everything else.
+//
+// Note: A Proxy approach was tried first but caused requests to hang — the
+// Proxy's `get` trap returns a new function each time `writeHead` is accessed,
+// which breaks Hono's internal response flow. Direct monkey-patching works.
+
+/**
+ * Patches a ServerResponse so that every `writeHead` / `flushHeaders` call
+ * includes the `mcp-protocol-version` response header.
+ */
+function withProtocolVersionHeader(res: ServerResponse): ServerResponse {
+  const originalWriteHead = res.writeHead.bind(res);
+  const originalFlushHeaders = res.flushHeaders.bind(res);
+
+  res.writeHead = ((statusCode: number, ...rest: unknown[]): ServerResponse => {
+    // writeHead overloads: (status) | (status, headers) | (status, message, headers)
+    let headers: Record<string, string | string[]> | undefined;
+    if (rest.length === 1 && typeof rest[0] === "object" && rest[0] !== null) {
+      headers = { ...(rest[0] as Record<string, string | string[]>) };
+    } else if (rest.length === 2 && typeof rest[1] === "object" && rest[1] !== null) {
+      headers = { ...(rest[1] as Record<string, string | string[]>) };
+    }
+    if (headers) {
+      headers["mcp-protocol-version"] = MCP_PROTOCOL_VERSION;
+      return originalWriteHead(statusCode, headers);
+    }
+    // No headers arg — set via setHeader so writeHead picks it up
+    if (!res.hasHeader("mcp-protocol-version")) {
+      res.setHeader("mcp-protocol-version", MCP_PROTOCOL_VERSION);
+    }
+    return originalWriteHead(statusCode, ...(rest as []));
+  }) as typeof res.writeHead;
+
+  res.flushHeaders = (): void => {
+    if (!res.hasHeader("mcp-protocol-version")) {
+      res.setHeader("mcp-protocol-version", MCP_PROTOCOL_VERSION);
+    }
+    originalFlushHeaders();
+  };
+
+  return res;
+}
+
 // ─── Server Class ───────────────────────────────────────────────────────────
+
+/** A connected client session: its own transport + McpServer instance */
+interface ClientSession {
+  transport: StreamableHTTPServerTransport;
+  mcpServer: McpServer;
+}
 
 export class NexusServer {
   private httpServer: ReturnType<typeof createServer>;
-  /** The SDK McpServer instance — exposed for notifications */
-  readonly mcpServer: McpServer;
-  private transport: StreamableHTTPServerTransport;
   private index: NexusIndex;
   private config: NexusConfig;
+  private searchEngine: SearchEngine;
   /** Namespaced names of preloaded tools (populated by resolvePreloadedTools) */
   private preloadedToolNames: Set<string> = new Set();
+  /** Per-source Promise chain locks for serializing index mutations (A2) */
+  private sourceLocks = new Map<string, Promise<void>>();
+  /**
+   * Active client sessions, keyed by session ID.
+   *
+   * The SDK's StreamableHTTPServerTransport is single-session: once one client
+   * calls `initialize`, the transport locks to that session and rejects all
+   * other clients. To support multiple concurrent clients (e.g. VS Code +
+   * another agent), we create a new transport + McpServer pair per session,
+   * following the SDK's own `simpleStreamableHttp` example.
+   */
+  private sessions = new Map<string, ClientSession>();
 
-  constructor(config: NexusConfig, index: NexusIndex) {
+  constructor(config: NexusConfig, index: NexusIndex, searchEngine: SearchEngine) {
     this.config = config;
     this.index = index;
-
-    // Create the MCP server using the SDK's high-level API
-    this.mcpServer = new McpServer({ name: "mcp-nexus", version: SERVER_VERSION }, { capabilities: { tools: { listChanged: true } } });
-
-    // Register the 5 nexus management tools
-    this.registerNexusTools();
-
-    // Override the SDK's tools/list handler to merge preloaded tools
-    // (which carry their original JSON Schema from upstream) with the
-    // SDK-registered nexus tools (which use Zod schemas).
-    this.installToolsListHandler();
-
-    // Create the Streamable HTTP transport (stateful mode)
-    this.transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-    });
+    this.searchEngine = searchEngine;
 
     // Create the HTTP server with middleware (auth, CORS, health)
     this.httpServer = this.createHttpServer();
   }
 
-  /** Register the 5 nexus management tools with the SDK's McpServer */
-  private registerNexusTools(): void {
+  /** Register the 6 nexus management tools with the given SDK McpServer instance */
+  private registerNexusTools(mcpServer: McpServer): void {
     // ─── browse_services ───────────────────────────────────────────────────
-    this.mcpServer.registerTool(
+    mcpServer.registerTool(
       "browse_services",
       {
         description:
@@ -83,7 +157,7 @@ export class NexusServer {
     );
 
     // ─── browse_tools ─────────────────────────────────────────────────────
-    this.mcpServer.registerTool(
+    mcpServer.registerTool(
       "browse_tools",
       {
         description:
@@ -112,8 +186,47 @@ export class NexusServer {
       },
     );
 
+    // ─── search_tools ─────────────────────────────────────────────────────
+    // Description is dynamic based on the active search strategy so the LLM
+    // knows whether to use keyword-style queries (lexical) or natural-language
+    // queries (semantic). The strategy is fixed at startup via config.
+    const isSemantic = this.config.search.type === "semantic";
+    const searchDescription = isSemantic
+      ? "Search for tools across all services (or within a single service) by semantic similarity. Returns matching tool names and their service IDs, ranked by relevance. Use this to find the right tool without browsing every service. Use natural-language queries describing what you want to do (e.g. 'I want to send an email', 'find tools for managing my inbox')."
+      : "Search for tools across all services (or within a single service) by keyword matching. Returns matching tool names and their service IDs, ranked by relevance. Use this to find the right tool without browsing every service. Use concise keywords that appear in tool names or descriptions (e.g. 'send email', 'ebay orders', 'create task').";
+    const queryDescription = isSemantic
+      ? "Search query — natural language description of what you want to do (e.g. 'I want to send an email', 'find tools for managing my inbox')"
+      : "Search query — keywords that appear in tool names or descriptions (e.g. 'send email', 'ebay orders', 'create task')";
+
+    mcpServer.registerTool(
+      "search_tools",
+      {
+        description: searchDescription,
+        inputSchema: {
+          query: z.string().describe(queryDescription),
+          serviceId: z.string().optional().describe("Optional: restrict search to a single service"),
+        },
+      },
+      async ({ query, serviceId }) => {
+        if (!query || !query.trim()) {
+          return { content: [{ type: "text", text: "Missing required parameter: query" }], isError: true };
+        }
+
+        const result = await this.searchEngine.search(query, serviceId);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result),
+            },
+          ],
+        };
+      },
+    );
+
     // ─── get_schemas ───────────────────────────────────────────────────────
-    this.mcpServer.registerTool(
+    mcpServer.registerTool(
       "get_schemas",
       {
         description:
@@ -157,7 +270,7 @@ export class NexusServer {
     );
 
     // ─── call_tool ─────────────────────────────────────────────────────────
-    this.mcpServer.registerTool(
+    mcpServer.registerTool(
       "call_tool",
       {
         description:
@@ -171,7 +284,7 @@ export class NexusServer {
     );
 
     // ─── index (diagnostic) ────────────────────────────────────────────────
-    this.mcpServer.registerTool(
+    mcpServer.registerTool(
       "index",
       {
         description:
@@ -203,8 +316,15 @@ export class NexusServer {
    * Preloaded tools are registered with a passthrough Zod schema for
    * tools/call dispatch, but their real upstream JSON Schema is used
    * in the tools/list response.
+   *
+   * ⚠️ SDK COUPLING: This reaches into `mcpServer._registeredTools` (a private
+   * SDK field) and replicates the SDK's own Zod→JSON Schema conversion logic.
+   * This is unavoidable because `registerTool()` requires a Zod schema — it
+   * throws if you pass a raw JSON Schema object. If the SDK ever adds native
+   * raw-JSON-Schema support or changes `_registeredTools`, this method will
+   * need updating. Pin the SDK version in package.json to avoid surprises.
    */
-  private installToolsListHandler(): void {
+  private installToolsListHandler(mcpServer: McpServer): void {
     // Type for the SDK's internal registered tool structure
     type SdkRegisteredTool = {
       enabled: boolean;
@@ -218,9 +338,9 @@ export class NexusServer {
     };
     type SdkRegisteredTools = Record<string, SdkRegisteredTool>;
 
-    this.mcpServer.server.setRequestHandler(ListToolsRequestSchema, async () => {
+    mcpServer.server.setRequestHandler(ListToolsRequestSchema, async () => {
       // Access the SDK's internal _registeredTools map
-      const registered = (this.mcpServer as unknown as { _registeredTools: SdkRegisteredTools })._registeredTools;
+      const registered = (mcpServer as unknown as { _registeredTools: SdkRegisteredTools })._registeredTools;
 
       // Convert SDK-registered tools (Zod schemas → JSON Schema),
       // skipping preloaded tools which are added separately with their real schemas
@@ -272,10 +392,13 @@ export class NexusServer {
 
   /**
    * Resolve per-source preloaded tool names against the built index.
-   * Registers them with the SDK's McpServer (using a passthrough Zod schema
-   * so tools/call dispatch works) and stores their names for the custom
+   * Registers them with all active McpServer sessions (using a passthrough Zod
+   * schema so tools/call dispatch works) and stores their names for the custom
    * tools/list handler to merge with the correct upstream JSON Schema.
    * Must be called after buildIndex() completes.
+   *
+   * Note: New sessions created after this call will also get preloaded tools
+   * registered during session creation (see createSession).
    */
   resolvePreloadedTools(): void {
     this.preloadedToolNames = new Set();
@@ -289,16 +412,6 @@ export class NexusServer {
         const namespaced = namespaceTool(sourceId, name);
         const indexed = this.index.tools.get(namespaced);
         if (indexed) {
-          // Register with SDK using passthrough schema so tools/call dispatch works.
-          // The custom tools/list handler replaces the schema with the upstream JSON Schema.
-          this.mcpServer.registerTool(
-            namespaced,
-            {
-              description: indexed.tool.description,
-              inputSchema: passthrough,
-            },
-            async (args) => this.executeCallTool(namespaced, args as Record<string, unknown>),
-          );
           this.preloadedToolNames.add(namespaced);
         } else {
           logger.warn(`Preloaded tool "${name}" not found in source "${sourceId}"`);
@@ -306,9 +419,45 @@ export class NexusServer {
       }
     }
 
+    // Register preloaded tools on all active sessions
+    for (const session of this.sessions.values()) {
+      this.registerPreloadedToolsOnServer(session.mcpServer, passthrough);
+    }
+
     if (this.preloadedToolNames.size > 0) {
       logger.info(`Preloaded ${this.preloadedToolNames.size} tool(s) into tools/list`);
-      this.mcpServer.sendToolListChanged();
+      this.broadcastToolListChanged();
+    }
+  }
+
+  /**
+   * Register preloaded tools on a specific McpServer instance.
+   * Called both during session creation and during resolvePreloadedTools.
+   */
+  private registerPreloadedToolsOnServer(mcpServer: McpServer, passthrough: z.ZodObject<{}, "passthrough">): void {
+    for (const namespaced of this.preloadedToolNames) {
+      const indexed = this.index.tools.get(namespaced);
+      if (indexed) {
+        mcpServer.registerTool(
+          namespaced,
+          {
+            description: indexed.tool.description,
+            inputSchema: passthrough,
+          },
+          async (args) => this.executeCallTool(namespaced, args as Record<string, unknown>),
+        );
+      }
+    }
+  }
+
+  /** Send tool list changed notification to all active sessions */
+  private broadcastToolListChanged(): void {
+    for (const session of this.sessions.values()) {
+      try {
+        session.mcpServer.sendToolListChanged();
+      } catch {
+        // Session may have been closed concurrently — ignore
+      }
     }
   }
 
@@ -349,9 +498,13 @@ export class NexusServer {
 
     // Route to the right transport
     const caller = source.config.transport === "http" ? httpCallTool : stdioCallTool;
-    const result = await caller(source.config, parsed.toolName, parameters);
+    const result: UpstreamCallResult = await caller(source.config, parsed.toolName, parameters);
 
     if (result.error) {
+      // A3: On transport error, update source status and add to failedSources
+      source.lastError = result.error;
+      this.index.failedSources.add(parsed.sourceId);
+
       // Check for stale-schema error — trigger re-index
       const isStaleSchema =
         result.error.includes("-32601") ||
@@ -374,11 +527,32 @@ export class NexusServer {
       };
     }
 
+    // Clear error state on success (A3)
+    if (source.lastError) {
+      source.lastError = undefined;
+      this.index.failedSources.delete(parsed.sourceId);
+    }
+
     return { content: [{ type: "text", text: JSON.stringify(result.content) }] };
   }
 
-  /** Re-fetch tools for a specific source and update the index */
+  /** Re-fetch tools for a specific source and update the index (Q2 + A2) */
   async refreshSource(sourceId: string): Promise<void> {
+    const source = this.index.sources.get(sourceId);
+    if (!source) return;
+
+    // A2: Serialize index mutations per source via a Promise chain lock
+    const prev = this.sourceLocks.get(sourceId) ?? Promise.resolve();
+    const next = prev.then(() => this.doRefreshSource(sourceId));
+    this.sourceLocks.set(
+      sourceId,
+      next.catch(() => {}),
+    ); // swallow to keep chain alive
+    await next;
+  }
+
+  /** Internal: performs the actual re-index for a source (called under lock) */
+  private async doRefreshSource(sourceId: string): Promise<void> {
     const source = this.index.sources.get(sourceId);
     if (!source) return;
 
@@ -388,32 +562,17 @@ export class NexusServer {
 
     if (error) {
       logger.warn(`Re-index of ${sourceId} failed: ${error}`);
+      source.lastError = error;
+      this.index.failedSources.add(sourceId);
       return;
     }
 
-    // Remove old tools for this source
-    for (const [name, indexed] of this.index.tools) {
-      if (indexed.sourceId === sourceId) {
-        this.index.tools.delete(name);
-      }
-    }
+    // Q2: Use shared updateSourceInIndex for O(source tools) deletion
+    updateSourceInIndex(sourceId, tools, this.index);
 
-    // Repopulate with new tools
-    source.tools = tools;
-    const sourceTools: IndexedTool[] = [];
-    for (const tool of tools) {
-      const namespaced = namespaceTool(sourceId, tool.name);
-      const indexed: IndexedTool = {
-        sourceId,
-        namespacedName: namespaced,
-        tool,
-      };
-      this.index.tools.set(namespaced, indexed);
-      sourceTools.push(indexed);
-    }
-    this.index.toolsBySource.set(sourceId, sourceTools);
     source.lastChecked = Date.now();
-    source.lastError = error;
+    source.lastError = undefined;
+    this.index.failedSources.delete(sourceId);
     logger.info(`Re-index of ${sourceId}: ${tools.length} tools`);
   }
 
@@ -443,10 +602,21 @@ export class NexusServer {
         return;
       }
 
-      // Health endpoint (non-MCP)
+      // Health endpoint (non-MCP) — A5: enhanced with source availability
       if (req.method === "GET" && req.url === "/health") {
+        const sources = Array.from(this.index.sources.values());
+        const available = sources.filter((s) => !s.lastError).length;
+        const failed = this.index.failedSources.size;
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok", uptime: process.uptime() }));
+        res.end(
+          JSON.stringify({
+            status: failed === 0 ? "ok" : "degraded",
+            uptime: process.uptime(),
+            sources: { total: sources.length, available, failed },
+            failedSourceIds: failed > 0 ? Array.from(this.index.failedSources) : undefined,
+            totalTools: this.index.tools.size,
+          }),
+        );
         return;
       }
 
@@ -458,26 +628,130 @@ export class NexusServer {
         const bBuf = Buffer.from(expected);
         const match = aBuf.length === bBuf.length && timingSafeEqual(aBuf, bBuf);
         if (!match) {
-          res.writeHead(401, {
-            "Content-Type": "application/json",
-            "mcp-protocol-version": "2025-03-26",
-          });
-          res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null }));
+          sendJsonRpcError(res, 401, -32001, "Unauthorized");
           return;
         }
       }
 
-      // Delegate all MCP requests to the SDK transport
-      await this.transport.handleRequest(req, res);
+      // Read and size-limit the request body for POST requests.
+      // The SDK transport calls req.json() with no cap; by pre-reading with a
+      // 1 MB limit and passing the parsed body as the 3rd arg, the SDK skips
+      // its own req.json() call. GET/DELETE have no body.
+      let parsedBody: unknown = undefined;
+      if (req.method === "POST") {
+        const MAX_BODY_BYTES = 1_048_576; // 1 MB — guards against memory exhaustion
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+        let bodyTooLarge = false;
+
+        for await (const chunk of req) {
+          totalBytes += chunk.length;
+          if (totalBytes > MAX_BODY_BYTES) {
+            bodyTooLarge = true;
+            break;
+          }
+          chunks.push(chunk);
+        }
+
+        if (bodyTooLarge) {
+          sendJsonRpcError(res, 413, -32000, "Request body too large (max 1 MB)");
+          return;
+        }
+
+        const raw = Buffer.concat(chunks).toString("utf-8");
+        try {
+          parsedBody = raw.length > 0 ? JSON.parse(raw) : undefined;
+        } catch {
+          sendJsonRpcError(res, 400, -32700, "Parse error: Invalid JSON");
+          return;
+        }
+      }
+
+      // Delegate to the appropriate session transport.
+      // The SDK's StreamableHTTPServerTransport is single-session, so we
+      // maintain one transport + McpServer per client, keyed by mcp-session-id.
+      // The SDK validates the mcp-protocol-version request header and handles
+      // session lifecycle, method routing, Accept/Content-Type checks, and
+      // JSON-RPC error envelopes natively. We only need to inject the
+      // mcp-protocol-version *response* header via the wrapper.
+      const wrapped = withProtocolVersionHeader(res);
+      await this.handleMcpRequest(req, wrapped, parsedBody);
     });
+  }
+
+  /**
+   * Route an MCP request to the correct session transport, or create a new
+   * session for initialize requests.
+   *
+   * This follows the SDK's recommended multi-session pattern from
+   * `simpleStreamableHttp.js`:
+   * 1. If the request has a session ID and we have that session → reuse it
+   * 2. If the request has no session ID and is an initialize request → create new session
+   * 3. Otherwise → 400 error (no valid session)
+   */
+  private async handleMcpRequest(req: IncomingMessage, res: ServerResponse, parsedBody: unknown): Promise<void> {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+    // Case 1: Existing session — reuse its transport
+    if (sessionId && this.sessions.has(sessionId)) {
+      const session = this.sessions.get(sessionId)!;
+      await session.transport.handleRequest(req, res, parsedBody);
+      return;
+    }
+
+    // Case 2: New initialization request — create a new session
+    if (!sessionId && parsedBody && isInitializeRequest(parsedBody)) {
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        enableJsonResponse: true,
+        onsessioninitialized: (sid) => {
+          // Store the transport by session ID when the session is initialized.
+          // This callback fires inside handleRequest, after the session ID has
+          // been generated but before the response is sent — so we can safely
+          // store the session for subsequent requests.
+          this.sessions.set(sid, { transport, mcpServer });
+          logger.debug(`Session initialized: ${sid} (active sessions: ${this.sessions.size})`);
+        },
+      });
+
+      // Clean up when the session closes (client disconnect, DELETE, or error)
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid && this.sessions.has(sid)) {
+          this.sessions.delete(sid);
+          logger.debug(`Session closed: ${sid} (active sessions: ${this.sessions.size})`);
+        }
+      };
+
+      // Create a fresh McpServer for this session and register all tools
+      const mcpServer = new McpServer(
+        { name: "mcp-nexus", version: SERVER_VERSION },
+        { capabilities: { tools: { listChanged: true } } },
+      );
+      this.registerNexusTools(mcpServer);
+      this.installToolsListHandler(mcpServer);
+
+      // Register any preloaded tools that were resolved before this session
+      if (this.preloadedToolNames.size > 0) {
+        this.registerPreloadedToolsOnServer(mcpServer, z.object({}).passthrough());
+      }
+
+      // Connect the transport to the McpServer BEFORE handling the request
+      // so responses can flow back through the same transport
+      await mcpServer.connect(transport);
+      await transport.handleRequest(req, res, parsedBody);
+      return;
+    }
+
+    // Case 3: Invalid request — no session ID or not initialization
+    sendJsonRpcError(res, 400, -32000, "Bad Request: No valid session ID provided");
   }
 
   // ─── Start / Shutdown ────────────────────────────────────────────────────
 
   async start(): Promise<void> {
-    // Connect the MCP server to the transport
-    await this.mcpServer.connect(this.transport);
-
+    // No transport to connect at startup — sessions are created on demand
+    // when clients send initialize requests.
     return new Promise((resolve) => {
       this.httpServer.listen(this.config.port, () => {
         logger.info(`mcp-nexus listening on port ${this.config.port}`);
@@ -490,7 +764,15 @@ export class NexusServer {
 
   async shutdown(): Promise<void> {
     logger.info("Shutting down...");
-    await this.mcpServer.close();
+    // Close all active sessions
+    for (const [sid, session] of this.sessions) {
+      try {
+        await session.mcpServer.close();
+      } catch {
+        // Session may already be closed — ignore
+      }
+      this.sessions.delete(sid);
+    }
     return new Promise((resolve) => {
       this.httpServer.close(() => {
         logger.info("HTTP server closed");

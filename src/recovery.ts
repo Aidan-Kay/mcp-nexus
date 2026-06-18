@@ -3,10 +3,10 @@
  * and re-indexes them once they respond. Keeps the nexus live without restart.
  */
 
+import { updateSourceInIndex } from "./indexer.js";
 import { logger } from "./logger.js";
-import { namespaceTool } from "./namespace.js";
 import type { NexusServer } from "./nexus-server.js";
-import type { IndexedTool, NexusIndex, SourceState } from "./types.js";
+import type { NexusIndex } from "./types.js";
 
 // Transport-specific fetchers
 import { fetchTools as httpFetch } from "./sources/http-source.js";
@@ -23,57 +23,46 @@ export function startRecovery(index: NexusIndex, intervalMs: number, server: Nex
   logger.info(`Starting recovery poller every ${Math.round(intervalMs / 1000)}s`);
 
   pollTimer = setInterval(async () => {
-    const failed: Array<{ id: string; state: SourceState }> = [];
+    // P1: Use failedSources Set for O(1) lookup instead of iterating all sources
+    if (index.failedSources.size === 0) return;
 
-    for (const [id, state] of index.sources) {
-      if (state.lastError) {
-        failed.push({ id, state });
-      }
-    }
+    // P1: Probe all failed sources concurrently with Promise.allSettled
+    const probeResults = await Promise.allSettled(
+      Array.from(index.failedSources).map(async (id) => {
+        const state = index.sources.get(id);
+        if (!state) return { id, recovered: false };
 
-    if (failed.length === 0) return;
+        logger.info(`Recovery probe: ${id}...`);
+        const fetcher = state.config.transport === "http" ? httpFetch : stdioFetch;
+        const { tools, error } = await fetcher(state.config);
 
-    for (const { id, state } of failed) {
-      logger.info(`Recovery probe: ${id}...`);
-      const fetcher = state.config.transport === "http" ? httpFetch : stdioFetch;
-      const { tools, error } = await fetcher(state.config);
-
-      if (error) {
-        logger.debug(`Recovery probe for ${id} still failing: ${error}`);
-        continue;
-      }
-
-      logger.info(`Recovery probe for ${id} succeeded — ${tools.length} tool(s) found, re-indexing`);
-
-      // Remove old tools for this source
-      for (const [name, indexed] of index.tools) {
-        if (indexed.sourceId === id) {
-          index.tools.delete(name);
+        if (error) {
+          logger.debug(`Recovery probe for ${id} still failing: ${error}`);
+          return { id, recovered: false };
         }
+
+        logger.info(`Recovery probe for ${id} succeeded — ${tools.length} tool(s) found, re-indexing`);
+
+        // Q2: Use shared updateSourceInIndex for O(source tools) deletion
+        updateSourceInIndex(id, tools, index);
+
+        state.lastError = undefined;
+        state.lastChecked = Date.now();
+        index.failedSources.delete(id);
+
+        // Re-resolve preloaded tools so tools/list picks up any new schemas
+        server.resolvePreloadedTools();
+
+        logger.info(`Recovered source ${id}: ${tools.length} tools now available`);
+        return { id, recovered: true };
+      }),
+    );
+
+    // Log any unexpected rejections
+    for (const result of probeResults) {
+      if (result.status === "rejected") {
+        logger.error(`Recovery probe error: ${result.reason}`);
       }
-
-      // Repopulate
-      state.tools = tools;
-      state.lastError = undefined;
-      state.lastChecked = Date.now();
-
-      const sourceTools: IndexedTool[] = [];
-      for (const tool of tools) {
-        const namespaced = namespaceTool(id, tool.name);
-        const indexed: IndexedTool = {
-          sourceId: id,
-          namespacedName: namespaced,
-          tool,
-        };
-        index.tools.set(namespaced, indexed);
-        sourceTools.push(indexed);
-      }
-      index.toolsBySource.set(id, sourceTools);
-
-      // Re-resolve preloaded tools so tools/list picks up any new schemas
-      server.resolvePreloadedTools();
-
-      logger.info(`Recovered source ${id}: ${tools.length} tools now available`);
     }
   }, intervalMs);
 

@@ -10,6 +10,24 @@ connectors:
   httpReuseIdleTimeoutSeconds: 300 # Reap idle upstream HTTP sessions after N seconds
   recoveryIntervalSeconds: 30 # Probe failed sources every N seconds (0 = disabled)
 
+search:
+  type: lexical # "lexical" (keyword matching) or "semantic" (embedding-based)
+  maxResults: 20 # Max results returned by search_tools
+  # semantic: # Uncomment to enable semantic search
+  #   provider: built-in # "built-in" (local model), "ollama", or "openai-compatible"
+  #   model: Xenova/all-MiniLM-L6-v2 # Model name (provider-specific)
+  #   batchSize: 32 # Batch size for embedding generation at index time
+  #   modelCachePath: /app/data/model-cache # Where to cache the model (built-in only)
+  #   # For ollama:
+  #   # provider: ollama
+  #   # baseUrl: http://ollama:11434
+  #   # model: nomic-embed-text
+  #   # For openai-compatible:
+  #   # provider: openai-compatible
+  #   # baseUrl: https://api.openai.com
+  #   # model: text-embedding-3-small
+  #   # apiKeyEnv: OPENAI_API_KEY # Name of env var containing the API key
+
 sources:
   - id: todoist
     name: Todoist

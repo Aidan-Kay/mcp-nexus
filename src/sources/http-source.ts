@@ -13,29 +13,14 @@ import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyFilter } from "../glob-utils.js";
-import { logger } from "../logger.js";
-import type { SourceConfig } from "../types.js";
+import { DEFAULT_REQUEST_TIMEOUT_MS } from "../indexer.js";
+import { logger, sourceLogger } from "../logger.js";
+import type { JsonRpcRequest, JsonRpcResponse, SourceConfig } from "../types.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const pkg = JSON.parse(readFileSync(resolve(__dirname, "../../package.json"), "utf-8")) as { version: string };
 const CLIENT_VERSION = pkg.version;
-
-// ─── JSON-RPC Types ─────────────────────────────────────────────────────────
-
-interface JsonRpcRequest {
-  jsonrpc: "2.0";
-  id?: string;
-  method: string;
-  params?: Record<string, unknown>;
-}
-
-interface JsonRpcResponse {
-  jsonrpc: "2.0";
-  id: string;
-  result?: unknown;
-  error?: { code: number; message: string; data?: unknown };
-}
 
 // ─── Session State ───────────────────────────────────────────────────────────
 
@@ -110,7 +95,7 @@ export function shutdownHttp(): void {
 
 let reqCounter = 0;
 function nextId(): string {
-  return `cat-${++reqCounter}`;
+  return `nexus-${++reqCounter}`;
 }
 
 // ─── HTTP Request ───────────────────────────────────────────────────────────
@@ -121,6 +106,7 @@ function sendJsonRpc(
   sessionId?: string,
   signal?: AbortSignal,
   agent?: HttpAgent | HttpsAgent,
+  timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
 ): Promise<{ response: JsonRpcResponse; newSessionId?: string }> {
   return new Promise((resolve, reject) => {
     const isHttps = url.startsWith("https://");
@@ -142,7 +128,7 @@ function sendJsonRpc(
       path: parsedUrl.pathname + parsedUrl.search,
       method: "POST",
       headers,
-      timeout: 15_000,
+      timeout: timeoutMs,
       signal,
       agent,
     };
@@ -195,7 +181,7 @@ function sendJsonRpc(
     req.on("error", reject);
     req.on("timeout", () => {
       req.destroy();
-      reject(new Error("Request timed out after 15s"));
+      reject(new Error(`Request timed out after ${timeoutMs}ms`));
     });
 
     req.write(JSON.stringify(body));
@@ -207,7 +193,13 @@ function sendJsonRpc(
  * Fire-and-forget JSON-RPC notification (no id, no response parsing).
  * Used for notifications/initialized, which the server ACKs with an empty body.
  */
-function sendNotification(url: string, body: JsonRpcRequest, sessionId: string, agent?: HttpAgent | HttpsAgent): void {
+function sendNotification(
+  url: string,
+  body: JsonRpcRequest,
+  sessionId: string,
+  agent?: HttpAgent | HttpsAgent,
+  timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
+): void {
   try {
     const isHttps = url.startsWith("https://");
     const requester = isHttps ? httpsRequest : httpRequest;
@@ -223,7 +215,7 @@ function sendNotification(url: string, body: JsonRpcRequest, sessionId: string, 
         "User-Agent": "mcp-nexus/1.0",
         "mcp-session-id": sessionId,
       },
-      timeout: 15_000,
+      timeout: timeoutMs,
       agent,
     });
     // Drain and discard any response so the socket can be reused by keep-alive.
@@ -263,7 +255,9 @@ async function ensureSession(config: SourceConfig): Promise<string | null> {
 async function initSession(config: SourceConfig): Promise<string | null> {
   if (!config.url) return null;
 
-  logger.info(`HTTP source ${config.id}: initializing session`);
+  const slog = sourceLogger(config.id);
+  const timeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  slog.info("initializing session");
 
   const agent = getAgent(config);
   const { response, newSessionId } = await sendJsonRpc(
@@ -281,6 +275,7 @@ async function initSession(config: SourceConfig): Promise<string | null> {
     undefined,
     undefined,
     agent,
+    timeoutMs,
   );
 
   if (response.error) {
@@ -310,7 +305,7 @@ async function initSession(config: SourceConfig): Promise<string | null> {
     lastUsed: Date.now(),
   });
 
-  logger.info(`HTTP source ${config.id}: session established (${result.serverInfo.name} ${result.serverInfo.version})`);
+  slog.info(`session established (${result.serverInfo.name} ${result.serverInfo.version})`);
 
   // Send initialized notification (fire-and-forget, must omit id per JSON-RPC spec)
   sendNotification(
@@ -321,6 +316,7 @@ async function initSession(config: SourceConfig): Promise<string | null> {
     },
     newSessionId,
     agent,
+    timeoutMs,
   );
 
   return newSessionId;
@@ -341,6 +337,9 @@ async function sendWithRetry(
 ): Promise<{ response: JsonRpcResponse; error?: string }> {
   if (!config.url) return { response: { jsonrpc: "2.0", id: "" }, error: "No URL configured" };
 
+  const slog = sourceLogger(config.id);
+  const timeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+
   for (let attempt = 1; attempt <= 2; attempt++) {
     const sessionId = await ensureSession(config);
     if (!sessionId) return { response: { jsonrpc: "2.0", id: "" }, error: "No URL configured" };
@@ -357,6 +356,7 @@ async function sendWithRetry(
         sessionId,
         undefined,
         getAgent(config),
+        timeoutMs,
       );
 
       touchSession(config.id);
@@ -367,7 +367,7 @@ async function sendWithRetry(
       const isSessionError = response.error.code === -32001 || (response.error.message ?? "").toLowerCase().includes("session");
 
       if (isSessionError && attempt === 1) {
-        logger.info(`HTTP source ${config.id}: session expired, re-initializing...`);
+        slog.info("session expired, re-initializing...");
         sessions.delete(config.id);
         continue; // retry with fresh session
       }
@@ -377,7 +377,7 @@ async function sendWithRetry(
       const msg = err instanceof Error ? err.message : String(err);
       // Transient network error — retry once
       if (attempt === 1) {
-        logger.info(`HTTP source ${config.id}: request failed (${msg}), retrying with fresh session...`);
+        slog.info(`request failed (${msg}), retrying with fresh session...`);
         sessions.delete(config.id);
         continue;
       }
@@ -396,6 +396,8 @@ export async function fetchTools(config: SourceConfig): Promise<{ tools: Tool[];
     return { tools: [], error: "No URL configured for HTTP source" };
   }
 
+  const slog = sourceLogger(config.id);
+
   try {
     const { response, error } = await sendWithRetry(config, "tools/list", {});
 
@@ -409,7 +411,7 @@ export async function fetchTools(config: SourceConfig): Promise<{ tools: Tool[];
     // Apply glob filter if configured
     const filtered = config.filter && config.filter.length > 0 ? applyFilter(tools, config.filter) : tools;
 
-    logger.info(`HTTP source ${config.id}: fetched ${filtered.length}/${tools.length} tools`);
+    slog.info(`fetched ${filtered.length}/${tools.length} tools`);
     return { tools: filtered };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

@@ -7,37 +7,22 @@ import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { applyFilter } from "../glob-utils.js";
-import { logger } from "../logger.js";
-import type { SourceConfig } from "../types.js";
+import { DEFAULT_REQUEST_TIMEOUT_MS } from "../indexer.js";
+import { sourceLogger } from "../logger.js";
+import type { JsonRpcRequest, JsonRpcResponse, SourceConfig } from "../types.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const pkg = JSON.parse(readFileSync(resolve(__dirname, "../../package.json"), "utf-8")) as { version: string };
 const CLIENT_VERSION = pkg.version;
 
-// ─── JSON-RPC Types ─────────────────────────────────────────────────────────
-
-interface JsonRpcRequest {
-  jsonrpc: "2.0";
-  id?: string;
-  method: string;
-  params?: Record<string, unknown>;
-}
-
-interface JsonRpcResponse {
-  jsonrpc: "2.0";
-  id: string;
-  result?: unknown;
-  error?: { code: number; message: string; data?: unknown };
-}
+// ─── Process Manager ────────────────────────────────────────────────────────
 
 interface PendingRequest {
   resolve: (value: JsonRpcResponse) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
 }
-
-// ─── Process Manager ────────────────────────────────────────────────────────
 
 interface StdioSession {
   process: ChildProcess;
@@ -54,7 +39,7 @@ interface StdioSession {
 
 let reqCounter = 0;
 function nextId(): string {
-  return `cat-${++reqCounter}`;
+  return `nexus-${++reqCounter}`;
 }
 
 const sessions = new Map<string, StdioSession>();
@@ -87,11 +72,23 @@ function spawnProcess(config: SourceConfig): StdioSession {
     throw new Error(`No command configured for stdio source ${config.id}`);
   }
 
-  logger.info(`Stdio source ${config.id}: spawning ${config.command}`);
+  const slog = sourceLogger(config.id);
+  slog.info(`spawning ${config.command}`);
+
+  // Build minimal env: PATH + HOME + config.env only — NOT process.env.
+  // Inheriting process.env leaks secrets, locale settings, and other host
+  // state into the child process (S4).
+  const childEnv: Record<string, string> = {};
+  if (process.env.PATH) childEnv.PATH = process.env.PATH;
+  if (process.env.HOME) childEnv.HOME = process.env.HOME;
+  if (process.env.USERPROFILE) childEnv.USERPROFILE = process.env.USERPROFILE;
+  if (process.env.TEMP) childEnv.TEMP = process.env.TEMP;
+  if (process.env.TMP) childEnv.TMP = process.env.TMP;
+  if (config.env) Object.assign(childEnv, config.env);
 
   const proc = spawn(config.command, config.args ?? [], {
     cwd: config.cwd,
-    env: { ...process.env, ...config.env },
+    env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
     shell: false,
   });
@@ -104,7 +101,7 @@ function spawnProcess(config: SourceConfig): StdioSession {
   proc.stderr!.on("data", (chunk: Buffer) => {
     const text = chunk.toString("utf-8").trimEnd();
     if (text) {
-      logger.debug(`Stdio ${config.id} stderr: ${text}`);
+      slog.debug(`stderr: ${text}`);
     }
   });
 
@@ -122,7 +119,7 @@ function spawnProcess(config: SourceConfig): StdioSession {
     try {
       parsed = JSON.parse(line);
     } catch {
-      logger.warn(`Stdio ${config.id}: invalid JSON from subprocess — ${line.slice(0, 100)}`);
+      slog.warn(`invalid JSON from subprocess — ${line.slice(0, 100)}`);
       return;
     }
     const pendingReq = pending.get(parsed.id);
@@ -134,11 +131,11 @@ function spawnProcess(config: SourceConfig): StdioSession {
   });
 
   proc.on("error", (err) => {
-    logger.error(`Stdio ${config.id}: process error — ${err.message}`);
+    slog.error(`process error — ${err.message}`);
   });
 
   proc.on("exit", (code, signal) => {
-    logger.warn(`Stdio ${config.id}: exited code=${code} signal=${signal}`);
+    slog.warn(`exited code=${code} signal=${signal}`);
     // Reject all pending
     for (const [, req] of pending) {
       clearTimeout(req.timer);
@@ -166,11 +163,12 @@ function sendRequest(config: SourceConfig, method: string, params?: Record<strin
   return new Promise((resolve, reject) => {
     const session = getOrSpawn(config);
     const id = nextId();
+    const timeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
     const timer = setTimeout(() => {
       session.pending.delete(id);
-      reject(new Error(`Request ${id} timed out after 15s`));
-    }, 15_000);
+      reject(new Error(`Request ${id} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
 
     session.pending.set(id, { resolve, reject, timer });
 
@@ -198,7 +196,8 @@ async function ensureInitialized(config: SourceConfig): Promise<void> {
   if (session.initializing) return session.initializing;
 
   session.initializing = (async () => {
-    logger.info(`Stdio source ${config.id}: performing MCP initialize handshake`);
+    const slog = sourceLogger(config.id);
+    slog.info("performing MCP initialize handshake");
 
     const response = await sendRequest(config, "initialize", {
       protocolVersion: "2025-11-05",
@@ -255,6 +254,8 @@ export async function fetchTools(config: SourceConfig): Promise<{ tools: Tool[];
     return { tools: [], error: "No command configured for stdio source" };
   }
 
+  const slog = sourceLogger(config.id);
+
   try {
     const response = await sendWithInitialize(config, "tools/list", {});
 
@@ -268,7 +269,7 @@ export async function fetchTools(config: SourceConfig): Promise<{ tools: Tool[];
     // Apply glob filter if configured
     const filtered = config.filter && config.filter.length > 0 ? applyFilter(tools, config.filter) : tools;
 
-    logger.info(`Stdio source ${config.id}: fetched ${filtered.length}/${tools.length} tools`);
+    slog.info(`fetched ${filtered.length}/${tools.length} tools`);
     return { tools: filtered };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
