@@ -24,11 +24,6 @@ export class BuiltinEmbeddingProvider implements EmbeddingProvider {
   }
 
   async init(): Promise<void> {
-    // Set cache directory before importing the library
-    if (this.cachePath) {
-      process.env["TRANSFORMERS_CACHE"] = this.cachePath;
-    }
-
     logger.info(`Loading embedding model: ${this.model}`);
     if (this.cachePath) {
       logger.info(`Model cache path: ${this.cachePath}`);
@@ -36,7 +31,15 @@ export class BuiltinEmbeddingProvider implements EmbeddingProvider {
 
     // Dynamic import — keeps @xenova/transformers out of the main bundle
     // and allows the server to start without it when using lexical search.
-    const { pipeline } = await import("@xenova/transformers");
+    const { pipeline, env } = await import("@xenova/transformers");
+
+    // Transformers.js does NOT read TRANSFORMERS_CACHE env var — it defaults to
+    // path.join(__dirname, '/.cache/') inside node_modules, which is read-only in
+    // Docker. Must set env.cacheDir explicitly.
+    if (this.cachePath) {
+      env.cacheDir = this.cachePath;
+    }
+
     this.pipeline = await pipeline("feature-extraction", this.model);
     logger.info(`Embedding model loaded (${this.dimensions} dimensions)`);
   }
