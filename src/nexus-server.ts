@@ -431,6 +431,24 @@ export class NexusServer {
   }
 
   /**
+   * Generate embeddings for a recovered source's tools.
+   * Called by the recovery poller after a source comes back online.
+   */
+  async generateEmbeddingsForSource(sourceId: string): Promise<void> {
+    const embeddingIndex = this.searchEngine.getEmbeddingIndex();
+    const provider = this.searchEngine.getEmbeddingProvider();
+    if (!embeddingIndex || !provider) return; // lexical search — nothing to do
+
+    const sourceTools = this.index.toolsBySource.get(sourceId) ?? [];
+
+    // Remove old embeddings for this source (in case of re-recovery)
+    embeddingIndex.removeSource(sourceId);
+
+    // Generate new embeddings
+    await embeddingIndex.generateEmbeddingsForSource(sourceTools, provider, this.config.search.semantic?.batchSize ?? 32);
+  }
+
+  /**
    * Register preloaded tools on a specific McpServer instance.
    * Called both during session creation and during resolvePreloadedTools.
    */
@@ -724,10 +742,7 @@ export class NexusServer {
       };
 
       // Create a fresh McpServer for this session and register all tools
-      const mcpServer = new McpServer(
-        { name: "mcp-nexus", version: SERVER_VERSION },
-        { capabilities: { tools: { listChanged: true } } },
-      );
+      const mcpServer = new McpServer({ name: "mcp-nexus", version: SERVER_VERSION }, { capabilities: { tools: { listChanged: true } } });
       this.registerNexusTools(mcpServer);
       this.installToolsListHandler(mcpServer);
 

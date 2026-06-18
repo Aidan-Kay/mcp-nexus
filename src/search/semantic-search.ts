@@ -70,6 +70,36 @@ export class EmbeddingIndex {
     return scored;
   }
 
+  /** Remove embeddings for a source (used when re-indexing a recovered source) */
+  removeSource(sourceId: string): void {
+    for (const [name, src] of this.toolSources) {
+      if (src === sourceId) {
+        this.embeddings.delete(name);
+        this.toolSources.delete(name);
+      }
+    }
+  }
+
+  /** Generate embeddings for a single source's tools (used during recovery) */
+  async generateEmbeddingsForSource(
+    tools: import("../types.js").IndexedTool[],
+    provider: EmbeddingProvider,
+    batchSize: number,
+  ): Promise<void> {
+    if (tools.length === 0) return;
+
+    logger.info(`Generating embeddings for ${tools.length} recovered tool(s)...`);
+    const texts = tools.map((t) => toolToText(t));
+    const vectors = await provider.embedBatch(texts, batchSize);
+
+    for (let i = 0; i < tools.length; i++) {
+      this.embeddings.set(tools[i].namespacedName, vectors[i]);
+      this.toolSources.set(tools[i].namespacedName, tools[i].sourceId);
+    }
+
+    logger.info(`Embeddings generated: ${tools.length} tool(s) added (${this.embeddings.size} total)`);
+  }
+
   get size(): number {
     return this.embeddings.size;
   }

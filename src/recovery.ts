@@ -50,6 +50,9 @@ export function startRecovery(index: NexusIndex, intervalMs: number, server: Nex
         state.lastChecked = Date.now();
         index.failedSources.delete(id);
 
+        // Generate embeddings for the recovered tools (no-op for lexical search)
+        await server.generateEmbeddingsForSource(id);
+
         // Re-resolve preloaded tools so tools/list picks up any new schemas
         server.resolvePreloadedTools();
 

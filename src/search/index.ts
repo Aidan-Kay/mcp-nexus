@@ -34,6 +34,16 @@ export class SearchEngine {
     this.embeddingIndex = embeddingIndex;
   }
 
+  /** Get the embedding index (used by recovery to generate embeddings for recovered tools) */
+  getEmbeddingIndex(): EmbeddingIndex | undefined {
+    return this.embeddingIndex;
+  }
+
+  /** Get the embedding provider (used by recovery) */
+  getEmbeddingProvider(): EmbeddingProvider | undefined {
+    return this.provider;
+  }
+
   async search(query: string, serviceId?: string): Promise<SearchResult> {
     const max = this.config.maxResults;
 
