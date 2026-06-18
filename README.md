@@ -97,28 +97,28 @@ sources:
 
 ### Config Reference
 
-| Field                                    | Description                                                                                                        |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `port`                                   | HTTP port for the MCP endpoint (default: 8050)                                                                     |
-| `auth.enabled`                           | Require `Authorization: Bearer <token>` header                                                                     |
-| `auth.token`                             | Static bearer token (override via `MCP_NEXUS_AUTH_TOKEN` env var)                                                  |
-| `auth.allowedOrigins`                    | Optional list of origins allowed via CORS when auth is enabled. If omitted, the request `Origin` is reflected back |
-| `connectors.httpReuseIdleTimeoutSeconds` | Idle timeout before a cached upstream HTTP session is reaped (default: 300)                                        |
-| `connectors.recoveryIntervalSeconds`     | Interval (seconds) for background recovery probes of failed sources. 0 = disabled (default: 30)                    |
-| `search.type`                            | Search strategy: `"lexical"` (keyword matching, default) or `"semantic"` (embedding-based similarity)              |
-| `search.maxResults`                      | Max results returned by `search_tools` (default: 20)                                                              |
+| Field                                    | Description                                                                                                         |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `port`                                   | HTTP port for the MCP endpoint (default: 8050)                                                                      |
+| `auth.enabled`                           | Require `Authorization: Bearer <token>` header                                                                      |
+| `auth.token`                             | Static bearer token (override via `MCP_NEXUS_AUTH_TOKEN` env var)                                                   |
+| `auth.allowedOrigins`                    | Optional list of origins allowed via CORS when auth is enabled. If omitted, the request `Origin` is reflected back  |
+| `connectors.httpReuseIdleTimeoutSeconds` | Idle timeout before a cached upstream HTTP session is reaped (default: 300)                                         |
+| `connectors.recoveryIntervalSeconds`     | Interval (seconds) for background recovery probes of failed sources. 0 = disabled (default: 30)                     |
+| `search.type`                            | Search strategy: `"lexical"` (keyword matching, default) or `"semantic"` (embedding-based similarity)               |
+| `search.maxResults`                      | Max results returned by `search_tools` (default: 20)                                                                |
 | `search.semantic.provider`               | Embedding provider: `"built-in"` (local model), `"ollama"`, or `"openai-compatible"` (required if type is semantic) |
-| `search.semantic.model`                  | Model name (provider-specific; defaults vary by provider)                                                         |
-| `search.semantic.baseUrl`                | Base URL for `ollama` or `openai-compatible` providers (required for those providers)                              |
-| `search.semantic.apiKeyEnv`              | Name of env var containing the API key (required for `openai-compatible`)                                          |
-| `search.semantic.batchSize`              | Batch size for embedding generation at index time (default: 32)                                                   |
-| `search.semantic.modelCachePath`         | Where to cache the downloaded model (`built-in` provider only)                                                    |
-| `sources[].id`                           | Unique identifier for the source (used in namespaced tool names)                                                   |
-| `sources[].transport`                    | `"http"` for Streamable HTTP, `"stdio"` for subprocess                                                             |
-| `sources[].url`                          | Upstream MCP server URL (required for HTTP transport)                                                              |
-| `sources[].command`                      | Executable to spawn (required for stdio transport)                                                                 |
-| `sources[].filter`                       | Optional glob patterns to curate which tools are indexed                                                           |
-| `sources[].preloadedTools`               | Optional array of non-prefixed tool names to surface directly in `tools/list` (e.g. `[\"search-emails\"]`)         |
+| `search.semantic.model`                  | Model name (provider-specific; defaults vary by provider)                                                           |
+| `search.semantic.baseUrl`                | Base URL for `ollama` or `openai-compatible` providers (required for those providers)                               |
+| `search.semantic.apiKeyEnv`              | Name of env var containing the API key (required for `openai-compatible`)                                           |
+| `search.semantic.batchSize`              | Batch size for embedding generation at index time (default: 32)                                                     |
+| `search.semantic.modelCachePath`         | Where to cache the downloaded model (`built-in` provider only)                                                      |
+| `sources[].id`                           | Unique identifier for the source (used in namespaced tool names)                                                    |
+| `sources[].transport`                    | `"http"` for Streamable HTTP, `"stdio"` for subprocess                                                              |
+| `sources[].url`                          | Upstream MCP server URL (required for HTTP transport)                                                               |
+| `sources[].command`                      | Executable to spawn (required for stdio transport)                                                                  |
+| `sources[].filter`                       | Optional glob patterns to curate which tools are indexed                                                            |
+| `sources[].preloadedTools`               | Optional array of non-prefixed tool names to surface directly in `tools/list` (e.g. `[\"search-emails\"]`)          |
 
 ## Search
 
@@ -151,11 +151,11 @@ search:
 
 #### Embedding Providers
 
-| Provider              | Description                                              | Config                                                                 |
-| --------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------- |
-| `built-in`            | Local model via Transformers.js (all-MiniLM-L6-v2, 384d) | No external dependencies. Downloads model on first run.               |
-| `ollama`              | Local Ollama instance (nomic-embed-text, 768d)           | Requires `baseUrl` (e.g. `http://localhost:11434`)                     |
-| `openai-compatible`   | Any OpenAI-compatible API (text-embedding-3-small, 1536d) | Requires `baseUrl`, `apiKeyEnv`, and `model`                           |
+| Provider            | Description                                               | Config                                                  |
+| ------------------- | --------------------------------------------------------- | ------------------------------------------------------- |
+| `built-in`          | Local model via Transformers.js (all-MiniLM-L6-v2, 384d)  | No external dependencies. Downloads model on first run. |
+| `ollama`            | Local Ollama instance (nomic-embed-text, 768d)            | Requires `baseUrl` (e.g. `http://localhost:11434`)      |
+| `openai-compatible` | Any OpenAI-compatible API (text-embedding-3-small, 1536d) | Requires `baseUrl`, `apiKeyEnv`, and `model`            |
 
 If the semantic provider fails at query time (e.g. Ollama is down), the search engine **falls back to lexical** automatically. The response includes `strategy` and `fellBackToLexical` fields so the agent can tell what happened.
 
