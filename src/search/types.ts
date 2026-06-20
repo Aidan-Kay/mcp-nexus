@@ -65,23 +65,38 @@ export interface SearchResult {
 // ─── Tool Text Representation ────────────────────────────────────────────────
 
 /**
+ * Convert a snake_case identifier to space-separated words.
+ * e.g. "todoist_task_update" → "todoist task update", "task_id" → "task id"
+ */
+function snakeToWords(s: string): string {
+  return s.replace(/_/g, " ");
+}
+
+/**
  * Convert a tool definition into a text representation for embedding.
- * Combines the tool name, description, and parameter information.
+ *
+ * Combines the tool name (as natural words), description, and parameter
+ * names (as natural words).
+ *
+ * NOTE: Parameter *descriptions* are intentionally excluded. They are often
+ * verbose and repetitive (e.g. "(optional)", "takes precedence over X"),
+ * which dilutes the embedding and pushes the most relevant tools down in
+ * the ranking. Empirically, a tool with 15 verbose parameter descriptions
+ * (~200 words) ranks below a tool with 2 parameters (~40 words) even when
+ * the former is the obvious match — the parameter noise drowns out the
+ * signal from the tool name and description. Parameter *names* are kept
+ * because they carry useful semantic signal (e.g. "task_id", "due_date")
+ * without the dilution.
  */
 export function toolToText(tool: IndexedTool): string {
-  const parts: string[] = [`Tool: ${tool.namespacedName}`, `Description: ${tool.tool.description ?? ""}`];
+  const parts: string[] = [`Tool: ${snakeToWords(tool.namespacedName)}`, `Description: ${tool.tool.description ?? ""}`];
 
-  const schema = tool.tool.inputSchema as { properties?: Record<string, { description?: string; type?: string }> } | undefined;
+  const schema = tool.tool.inputSchema as { properties?: Record<string, unknown> } | undefined;
 
   if (schema?.properties) {
-    const paramDescs: string[] = [];
-    for (const [paramName, paramInfo] of Object.entries(schema.properties)) {
-      const desc = paramInfo.description ?? "";
-      const type = paramInfo.type ?? "";
-      paramDescs.push(`${paramName} (${type}): ${desc}`);
-    }
-    if (paramDescs.length > 0) {
-      parts.push(`Parameters: ${paramDescs.join(", ")}`);
+    const paramNames = Object.keys(schema.properties).map(snakeToWords);
+    if (paramNames.length > 0) {
+      parts.push(`Parameters: ${paramNames.join(", ")}`);
     }
   }
 
