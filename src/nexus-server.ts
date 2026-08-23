@@ -15,7 +15,7 @@ import { z } from "zod";
 import { updateSourceInIndex } from "./indexer.js";
 import { logger } from "./logger.js";
 import { namespaceTool, parseNamespacedName } from "./namespace.js";
-import { inferShape, minifyContent, resolveJsonBlock, textOf } from "./projection.js";
+import { inferShape, minifyContent, project, replaceJsonBlock, resolveJsonBlock, textOf } from "./projection.js";
 import type { SearchEngine } from "./search/index.js";
 import type { NexusConfig, NexusIndex, UpstreamCallResult } from "./types.js";
 
@@ -287,7 +287,7 @@ export class NexusServer {
       "call_tool",
       {
         description:
-          "Call a tool on an upstream MCP service. Pass the namespaced tool name (e.g. 'todoist__get-task') and its parameters. The response is passed through from the upstream service.",
+          "Call a tool on an upstream MCP service. Pass the namespaced tool name (e.g. 'todoist__get-task') and its parameters. The response is passed through from the upstream service. Use 'select' to trim wide responses down to the fields you need — get_schemas reports a 'responseShape' you can write those paths from.",
         inputSchema: {
           toolName: z.string().describe("The namespaced tool name to call (e.g. 'todoist__get-task')"),
           // ⚠️ Value type is spelled out explicitly rather than using z.unknown().
@@ -302,9 +302,15 @@ export class NexusServer {
             .describe(
               "The parameters to pass to the tool, matching its input schema. Pass each value with its native JSON type (e.g. 25, not {\"value\": 25}).",
             ),
+          select: z
+            .array(z.string())
+            .optional()
+            .describe(
+              "Optional dotted paths to trim the response to, e.g. ['total', 'inventoryItems[*].sku', 'inventoryItems[*].product.title']. '[*]' maps over an array. Nesting is preserved. A path that matches nothing is reported as an error rather than returned as absent data, so a typo cannot look like a missing field.",
+            ),
         },
       },
-      async ({ toolName, parameters = {} }) => this.executeCallTool(toolName, parameters),
+      async ({ toolName, parameters = {}, select }) => this.executeCallTool(toolName, parameters, select),
     );
 
     // ─── index (diagnostic) ────────────────────────────────────────────────
@@ -504,7 +510,11 @@ export class NexusServer {
   }
 
   /** Shared call_tool implementation — also used for preloaded tool dispatch */
-  private async executeCallTool(toolName: string, parameters: Record<string, unknown>): Promise<CallToolResult> {
+  private async executeCallTool(
+    toolName: string,
+    parameters: Record<string, unknown>,
+    select?: string[],
+  ): Promise<CallToolResult> {
     if (!toolName) {
       return { content: [{ type: "text", text: "Missing required parameter: toolName" }], isError: true };
     }
@@ -582,12 +592,70 @@ export class NexusServer {
       return { content: minifyContent(result.content) as CallToolResult["content"], isError: true };
     }
 
-    // Record what this tool returns so get_schemas can hand the shape to a caller
-    // that has not seen a response yet.
-    const payload = result.structuredContent ?? resolveJsonBlock(result.content)?.data;
+    // Resolve the JSON payload once — structuredContent when the service declares an
+    // outputSchema, otherwise the first text block that parses as JSON.
+    const jsonBlock = resolveJsonBlock(result.content);
+    const payload = result.structuredContent ?? jsonBlock?.data;
+
+    // Record the shape of the *full* payload before any trimming, so get_schemas can
+    // hand it to a caller that has not seen a response yet.
     if (payload !== undefined) this.responseShapes.set(toolName, inferShape(payload));
 
-    return { content: minifyContent(result.content) as CallToolResult["content"], structuredContent: result.structuredContent };
+    // An explicit select overrides the source's default projection for this tool
+    const paths = select ?? source.config.projections?.[parsed.toolName];
+    const explicit = select !== undefined;
+
+    if (!paths || paths.length === 0 || payload === undefined) {
+      if (explicit && payload === undefined) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Cannot apply 'select' to ${toolName}: the response contains no JSON payload to project. Retry without 'select'.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      return { content: minifyContent(result.content) as CallToolResult["content"], structuredContent: result.structuredContent };
+    }
+
+    const { result: projected, unmatched } = project(payload, paths);
+
+    // A path that matches nothing is a caller error, not an empty result — returning
+    // the trimmed data anyway would make a typo indistinguishable from absent data.
+    if (unmatched.length > 0 && explicit) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: `select paths matched nothing on ${toolName}`,
+              unmatched,
+              responseShape: this.responseShapes.get(toolName),
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const content = replaceJsonBlock(result.content, result.structuredContent ? -1 : (jsonBlock?.index ?? -1), projected);
+
+    // A configured projection that has drifted out of date warns rather than fails —
+    // the caller did not write it and cannot correct it.
+    if (unmatched.length > 0) {
+      logger.warn(`Configured projection for ${toolName} has stale paths: ${unmatched.join(", ")}`);
+      content.push({
+        type: "text",
+        text: `Note: this response was trimmed by a configured projection. These paths no longer exist upstream and were skipped: ${unmatched.join(", ")}`,
+      });
+    }
+
+    return {
+      content: content as CallToolResult["content"],
+      structuredContent: result.structuredContent ? (projected as Record<string, unknown>) : undefined,
+    };
   }
 
   /**

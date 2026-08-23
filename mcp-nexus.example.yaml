@@ -47,3 +47,21 @@ sources:
     preloadedTools:
       - search-emails
       - list-folders
+
+  - id: ebay
+    name: eBay
+    description: Marketplace listings and orders
+    transport: http
+    url: http://ebay-mcp:8086/mcp
+    # Default response projections for tools that always return more than callers
+    # need. Keyed by the tool's own (non-prefixed) name; each value is a list of
+    # dotted paths, where [*] maps over an array and nesting is preserved.
+    # A `select` argument on the call overrides the default for that call.
+    # Run get_schemas on a tool to see its responseShape and write paths from it.
+    projections:
+      ebay_get_inventory_items:
+        - total
+        - inventoryItems[*].sku
+        - inventoryItems[*].product.title
+        - inventoryItems[*].condition
+        - inventoryItems[*].availability.shipToLocationAvailability.quantity

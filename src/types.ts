@@ -49,6 +49,13 @@ export interface SourceConfig {
   env?: Record<string, string>;
   /** Non-prefixed tool names (e.g. "get-task") to surface directly in tools/list */
   preloadedTools?: string[];
+  /**
+   * Default response projections, keyed by non-prefixed tool name. Each value is a
+   * list of dotted paths (`inventoryItems[*].product.title`) that the response is
+   * trimmed to. Use this for tools that are always wider than callers need — a
+   * `select` argument on the call overrides it.
+   */
+  projections?: Record<string, string[]>;
   /** Per-source request timeout in milliseconds (default: 15000) */
   requestTimeoutMs?: number;
 }

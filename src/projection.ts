@@ -67,6 +67,18 @@ export function minifyContent(content: ContentBlock[]): ContentBlock[] {
   });
 }
 
+/**
+ * Return `content` with the JSON payload at `index` replaced by `data`, minified.
+ * When `index` is -1 the payload came from structuredContent rather than a text
+ * block, so the projected form is emitted as a fresh block.
+ */
+export function replaceJsonBlock(content: ContentBlock[], index: number, data: unknown): ContentBlock[] {
+  const text = JSON.stringify(data);
+  if (index < 0) return [{ type: "text", text }];
+
+  return content.map((block, i) => (i === index ? { ...block, text } : block));
+}
+
 // ─── Path Projection ─────────────────────────────────────────────────────────
 
 interface Segment {

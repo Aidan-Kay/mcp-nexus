@@ -119,6 +119,7 @@ sources:
 | `sources[].command`                      | Executable to spawn (required for stdio transport)                                                                  |
 | `sources[].filter`                       | Optional glob patterns to curate which tools are indexed                                                            |
 | `sources[].preloadedTools`               | Optional array of non-prefixed tool names to surface directly in `tools/list` (e.g. `[\"search-emails\"]`)          |
+| `sources[].projections`                  | Optional default response projections, keyed by non-prefixed tool name (see [Response Shaping](#response-shaping))   |
 
 ## Search
 
@@ -189,11 +190,48 @@ The nexus exposes these tools to connected AI agents:
 | `browse_services` | List all available upstream services with descriptions and tool counts |
 | `browse_tools`    | List all tools for a specific service (namespaced names)               |
 | `search_tools`    | Search for tools by keyword (lexical) or natural language (semantic)   |
-| `get_schemas`     | Get full input schemas for one or more tools in bulk                   |
-| `call_tool`       | Call a tool on an upstream service (passes through the result)         |
+| `get_schemas`     | Get input schemas and inferred response shapes for one or more tools   |
+| `call_tool`       | Call a tool on an upstream service, optionally trimming the response   |
 | `index`           | Diagnostic — shows index summary, source availability, and error info  |
 
 Additionally, any tools listed under `preloadedTools` on a source will appear directly in the `tools/list` response alongside the built-in nexus tools — no browsing needed.
+
+## Response Shaping
+
+Upstream tools routinely return far more than an agent needs — every field of every
+record, often pretty-printed. That width lands directly in the agent's context, so
+the nexus trims it on the way through.
+
+**Always applied.** Responses are forwarded as the upstream service's own content
+blocks, with each JSON block re-serialised compactly. This is lossless — nothing is
+dropped, and blocks that aren't JSON (prose errors, images, embedded resources) pass
+through untouched. On live eBay responses this alone removes 38–48% of the bytes.
+
+**Projections.** To trim fields as well, give `call_tool` a `select` array of dotted
+paths. `[*]` maps over an array, and the original nesting is preserved:
+
+```jsonc
+{
+  "toolName": "ebay__ebay_get_inventory_items",
+  "parameters": { "limit": 25 },
+  "select": ["total", "inventoryItems[*].sku", "inventoryItems[*].product.title"]
+}
+```
+
+A path matching nothing is returned as an **error**, not as absent data, so a typo
+can't be mistaken for a field the service doesn't return. The error carries the
+tool's response shape so the caller can correct itself.
+
+For tools that are *always* too wide, set a default under `sources[].projections`
+instead — keyed by the tool's own name, applied to every call, and overridden by an
+explicit `select`. A configured projection whose paths have drifted out of date warns
+and skips them rather than failing, since the caller didn't write it.
+
+**Discovering paths.** Most services declare no `outputSchema`, so `get_schemas`
+reports a `responseShape` instead: the leaf paths and types of what the tool last
+returned, learned from calls as they pass through. Its size is fixed regardless of
+how many records came back. If a tool hasn't been called yet, make one small call
+first (most take a `limit` or `pageSize`) and the shape will be recorded.
 
 ## Architecture
 

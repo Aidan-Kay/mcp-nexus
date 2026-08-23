@@ -21,6 +21,7 @@ const SourceConfigSchema = z
     cwd: z.string().optional(),
     env: z.record(z.string()).optional(),
     preloadedTools: z.array(z.string()).optional(),
+    projections: z.record(z.array(z.string().min(1)).min(1)).optional(),
     requestTimeoutMs: z.number().int().min(1000).max(120_000).optional(),
   })
   .superRefine((s, ctx) => {
