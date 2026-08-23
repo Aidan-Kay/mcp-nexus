@@ -15,7 +15,7 @@ import { z } from "zod";
 import { updateSourceInIndex } from "./indexer.js";
 import { logger } from "./logger.js";
 import { namespaceTool, parseNamespacedName } from "./namespace.js";
-import { inferShape, minifyContent, project, replaceJsonBlock, resolveJsonBlock, textOf } from "./projection.js";
+import { inferShape, minifyContent, project, relevantShape, replaceJsonBlock, resolveJsonBlock, textOf } from "./projection.js";
 import type { SearchEngine } from "./search/index.js";
 import type { NexusConfig, NexusIndex, UpstreamCallResult } from "./types.js";
 
@@ -601,9 +601,15 @@ export class NexusServer {
     // hand it to a caller that has not seen a response yet.
     if (payload !== undefined) this.responseShapes.set(toolName, inferShape(payload));
 
-    // An explicit select overrides the source's default projection for this tool
-    const paths = select ?? source.config.projections?.[parsed.toolName];
-    const explicit = select !== undefined;
+    // An explicit select overrides the source's default projection for this tool.
+    //
+    // An empty array means "I am not selecting anything", not "select nothing" — it must
+    // fall through to the configured projection rather than past it. Treating it as a
+    // selection would let a caller silently opt out of a projection that exists to keep
+    // fields (buyer names, addresses) out of a response.
+    const requested = select && select.length > 0 ? select : undefined;
+    const paths = requested ?? source.config.projections?.[parsed.toolName];
+    const explicit = requested !== undefined;
 
     if (!paths || paths.length === 0 || payload === undefined) {
       if (explicit && payload === undefined) {
@@ -625,6 +631,10 @@ export class NexusServer {
     // A path that matches nothing is a caller error, not an empty result — returning
     // the trimmed data anyway would make a typo indistinguishable from absent data.
     if (unmatched.length > 0 && explicit) {
+      // Narrowed to the branch the failed paths were reaching into — the full shape of a
+      // wide response can cost many times the response the caller was asking for.
+      const { paths: shape, omitted } = relevantShape(this.responseShapes.get(toolName) ?? [], unmatched);
+
       return {
         content: [
           {
@@ -632,7 +642,9 @@ export class NexusServer {
             text: JSON.stringify({
               error: `select paths matched nothing on ${toolName}`,
               unmatched,
-              responseShape: this.responseShapes.get(toolName),
+              responseShape: shape,
+              responseShapeOmitted: omitted || undefined,
+              hint: omitted > 0 ? `call get_schemas for the full response shape of ${toolName}` : undefined,
             }),
           },
         ],
