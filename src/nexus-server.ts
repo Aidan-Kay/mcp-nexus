@@ -277,7 +277,18 @@ export class NexusServer {
           "Call a tool on an upstream MCP service. Pass the namespaced tool name (e.g. 'todoist__get-task') and its parameters. The response is passed through from the upstream service.",
         inputSchema: {
           toolName: z.string().describe("The namespaced tool name to call (e.g. 'todoist__get-task')"),
-          parameters: z.record(z.unknown()).optional().describe("The parameters to pass to the tool, matching its input schema"),
+          // ⚠️ Value type is spelled out explicitly rather than using z.unknown().
+          // z.record(z.unknown()) serialises to `additionalProperties: {}` — an empty
+          // schema meaning "any value" — which some MCP clients (Open WebUI's
+          // pydantic model builder, grammar-constrained decoders) misread as
+          // "object with no properties", silently replacing every scalar argument
+          // with {}. Enumerating the permitted JSON types removes the ambiguity.
+          parameters: z
+            .record(z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(z.any()), z.record(z.any())]))
+            .optional()
+            .describe(
+              "The parameters to pass to the tool, matching its input schema. Pass each value with its native JSON type (e.g. 25, not {\"value\": 25}).",
+            ),
         },
       },
       async ({ toolName, parameters = {} }) => this.executeCallTool(toolName, parameters),
