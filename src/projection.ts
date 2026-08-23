@@ -172,6 +172,33 @@ export function project(data: unknown, paths: string[]): { result: unknown; unma
   return { result: result ?? {}, unmatched };
 }
 
+/**
+ * Narrow an inferred shape to the part a failed path was reaching into.
+ *
+ * A wide response can carry well over a hundred leaf paths, so returning the whole
+ * shape on a single typo costs many times what the successful response would have.
+ * Matching on the failed path's parent prefix gives back the branch the caller was
+ * actually aiming at — smaller, and more use than a listing of the entire document.
+ * A path that fails at the root has no prefix to narrow by, so it falls back to a
+ * capped slice of the full shape.
+ */
+export function relevantShape(shape: string[], unmatched: string[], limit = 40): { paths: string[]; omitted: number } {
+  const matches = new Set<string>();
+
+  for (const path of unmatched) {
+    const cut = path.lastIndexOf(".");
+    if (cut < 0) continue;
+
+    const prefix = path.slice(0, cut + 1);
+    for (const entry of shape) {
+      if (entry.startsWith(prefix)) matches.add(entry);
+    }
+  }
+
+  const selected = matches.size > 0 ? [...matches] : shape;
+  return { paths: selected.slice(0, limit), omitted: Math.max(0, selected.length - limit) };
+}
+
 // ─── Shape Inference ─────────────────────────────────────────────────────────
 
 const MAX_INFERRED_PATHS = 200;
