@@ -15,6 +15,7 @@ import { z } from "zod";
 import { updateSourceInIndex } from "./indexer.js";
 import { logger } from "./logger.js";
 import { namespaceTool, parseNamespacedName } from "./namespace.js";
+import { minifyContent, textOf } from "./projection.js";
 import type { SearchEngine } from "./search/index.js";
 import type { NexusConfig, NexusIndex, UpstreamCallResult } from "./types.js";
 
@@ -556,13 +557,37 @@ export class NexusServer {
       };
     }
 
-    // Clear error state on success (A3)
+    // Clear transport error state — the call reached the service (A3)
     if (source.lastError) {
       source.lastError = undefined;
       this.index.failedSources.delete(parsed.sourceId);
     }
 
-    return { content: [{ type: "text", text: JSON.stringify(result.content) }] };
+    // A tool-level failure is forwarded as a failure. Previously it was stringified
+    // into a successful-looking blob, so callers could not tell a result from an error.
+    if (result.isError) {
+      await this.refreshIfStaleSchema(parsed.sourceId, textOf(result.content));
+      return { content: minifyContent(result.content) as CallToolResult["content"], isError: true };
+    }
+
+    return { content: minifyContent(result.content) as CallToolResult["content"], structuredContent: result.structuredContent };
+  }
+
+  /**
+   * Re-index a source when an error suggests our cached schema is out of date.
+   *
+   * Only unambiguous signals qualify here. A tool-level "invalid params" is almost
+   * always a malformed call rather than a stale schema, and re-indexing the whole
+   * source on every bad argument would be a needless round trip per mistake — that
+   * heuristic stays on the transport-error path, where it means the JSON-RPC method
+   * itself was rejected.
+   */
+  private async refreshIfStaleSchema(sourceId: string, message: string): Promise<void> {
+    const lowered = message.toLowerCase();
+    if (!message.includes("-32601") && !lowered.includes("method not found")) return;
+
+    logger.info(`Stale schema detected for ${sourceId}, triggering re-index...`);
+    await this.refreshSource(sourceId);
   }
 
   /** Re-fetch tools for a specific source and update the index (Q2 + A2) */

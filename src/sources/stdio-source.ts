@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 import { applyFilter } from "../glob-utils.js";
 import { DEFAULT_REQUEST_TIMEOUT_MS } from "../indexer.js";
 import { sourceLogger } from "../logger.js";
-import type { JsonRpcRequest, JsonRpcResponse, SourceConfig } from "../types.js";
+import type { ContentBlock } from "../projection.js";
+import type { JsonRpcRequest, JsonRpcResponse, SourceConfig, UpstreamCallResult } from "../types.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -282,7 +283,7 @@ export async function callTool(
   config: SourceConfig,
   toolName: string,
   args: Record<string, unknown>,
-): Promise<{ content: unknown; isError?: boolean; error?: string }> {
+): Promise<UpstreamCallResult> {
   if (!config.command) {
     return { content: [], error: "No command configured for stdio source" };
   }
@@ -297,7 +298,17 @@ export async function callTool(
       return { content: [], isError: true, error: response.error.message };
     }
 
-    return { content: response.result };
+    // Lift the upstream envelope apart rather than forwarding it whole — the caller
+    // re-wraps, which would escape the entire payload a second time.
+    const result = response.result as
+      | { content?: ContentBlock[]; structuredContent?: Record<string, unknown>; isError?: boolean }
+      | undefined;
+
+    return {
+      content: result?.content ?? [],
+      structuredContent: result?.structuredContent,
+      isError: result?.isError === true,
+    };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { content: [], isError: true, error: msg };

@@ -1,6 +1,7 @@
 /** Core types for mcp-nexus */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { ContentBlock } from "./projection.js";
 import type { SearchConfig } from "./search/types.js";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -115,8 +116,13 @@ export interface JsonRpcResponse {
 // ─── Upstream Call Result (consistent return type for callTool) ─────────────
 
 export interface UpstreamCallResult {
-  content: unknown;
+  /** Content blocks lifted out of the upstream CallToolResult — never the envelope itself */
+  content: ContentBlock[];
+  /** Structured payload, when the upstream tool declares an outputSchema */
+  structuredContent?: Record<string, unknown>;
+  /** Upstream signalled a tool-level failure (CallToolResult.isError) */
   isError?: boolean;
+  /** Transport- or protocol-level failure — distinct from a tool-level isError */
   error?: string;
 }
 
