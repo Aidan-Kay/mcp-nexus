@@ -642,14 +642,24 @@ export class NexusServer {
 
     const content = replaceJsonBlock(result.content, result.structuredContent ? -1 : (jsonBlock?.index ?? -1), projected);
 
-    // A configured projection that has drifted out of date warns rather than fails —
-    // the caller did not write it and cannot correct it.
+    // A configured projection that has drifted warns rather than fails — the caller did
+    // not write it and cannot correct it mid-call.
+    //
+    // Optional fields are legitimately absent from most responses: a variations block on
+    // a non-variation listing, a discounted price on an unpromoted line item. Noting each
+    // miss in the response would put a warning on nearly every call and spend the context
+    // the projection just saved, so misses go to the log for whoever wrote the config.
+    // Only a projection that matched *nothing* is worth telling the caller about, because
+    // then the response it is holding is empty.
     if (unmatched.length > 0) {
-      logger.warn(`Configured projection for ${toolName} has stale paths: ${unmatched.join(", ")}`);
-      content.push({
-        type: "text",
-        text: `Note: this response was trimmed by a configured projection. These paths no longer exist upstream and were skipped: ${unmatched.join(", ")}`,
-      });
+      logger.warn(`Projection for ${toolName} skipped unmatched paths: ${unmatched.join(", ")}`);
+
+      if (unmatched.length === paths.length) {
+        content.push({
+          type: "text",
+          text: `Note: the configured projection for this tool matched nothing — none of these paths exist upstream: ${unmatched.join(", ")}`,
+        });
+      }
     }
 
     return {
