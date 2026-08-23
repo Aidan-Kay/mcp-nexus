@@ -15,7 +15,7 @@ import { z } from "zod";
 import { updateSourceInIndex } from "./indexer.js";
 import { logger } from "./logger.js";
 import { namespaceTool, parseNamespacedName } from "./namespace.js";
-import { minifyContent, textOf } from "./projection.js";
+import { inferShape, minifyContent, resolveJsonBlock, textOf } from "./projection.js";
 import type { SearchEngine } from "./search/index.js";
 import type { NexusConfig, NexusIndex, UpstreamCallResult } from "./types.js";
 
@@ -115,6 +115,13 @@ export class NexusServer {
   private preloadedToolNames: Set<string> = new Set();
   /** Per-source Promise chain locks for serializing index mutations (A2) */
   private sourceLocks = new Map<string, Promise<void>>();
+  /**
+   * Inferred response shapes, keyed by namespaced tool name, learned from calls
+   * as they pass through. Most upstream services declare no outputSchema, so this
+   * is the only way a caller can discover what a tool returns without reading a
+   * whole response — which is precisely what `select` exists to avoid.
+   */
+  private responseShapes = new Map<string, string[]>();
   /**
    * Active client sessions, keyed by session ID.
    *
@@ -231,7 +238,7 @@ export class NexusServer {
       "get_schemas",
       {
         description:
-          "Get the full input schemas for one or more tools. Accepts an array of namespaced tool names (e.g. ['todoist__get-task', 'outlook__search-emails']). Returns the complete inputSchema for each tool.",
+          "Get the full input schemas for one or more tools. Accepts an array of namespaced tool names (e.g. ['todoist__get-task', 'outlook__search-emails']). Returns the complete inputSchema for each tool, plus 'responseShape' — the leaf paths and types of what the tool last returned — when this tool has been called before. Use responseShape to write the 'select' argument of call_tool. If it is absent, make one small call first (many tools take a limit/pageSize argument) and the shape will be recorded.",
         inputSchema: {
           toolNames: z.array(z.string()).describe("Array of namespaced tool names to get schemas for"),
         },
@@ -249,6 +256,8 @@ export class NexusServer {
           sourceId: string;
           description?: string;
           inputSchema: unknown;
+          outputSchema?: unknown;
+          responseShape?: string[];
         }> = [];
         const missing: string[] = [];
 
@@ -263,6 +272,9 @@ export class NexusServer {
             sourceId: indexed.sourceId,
             description: indexed.tool.description,
             inputSchema: indexed.tool.inputSchema,
+            // Declared by the upstream service — absent on most, hence responseShape below
+            outputSchema: indexed.tool.outputSchema,
+            responseShape: this.responseShapes.get(name),
           });
         }
 
@@ -569,6 +581,11 @@ export class NexusServer {
       await this.refreshIfStaleSchema(parsed.sourceId, textOf(result.content));
       return { content: minifyContent(result.content) as CallToolResult["content"], isError: true };
     }
+
+    // Record what this tool returns so get_schemas can hand the shape to a caller
+    // that has not seen a response yet.
+    const payload = result.structuredContent ?? resolveJsonBlock(result.content)?.data;
+    if (payload !== undefined) this.responseShapes.set(toolName, inferShape(payload));
 
     return { content: minifyContent(result.content) as CallToolResult["content"], structuredContent: result.structuredContent };
   }
