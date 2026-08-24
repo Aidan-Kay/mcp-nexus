@@ -3,3 +3,4 @@ dist
 md
 *.yaml
 !mcp-nexus.example.yaml
+tmp

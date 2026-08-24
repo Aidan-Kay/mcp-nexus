@@ -7,6 +7,7 @@
  * then exposes a Streamable HTTP MCP server with browse-first nexus tools.
  */
 
+import { initArtefacts, stopArtefacts } from "./artefacts.js";
 import { loadConfig } from "./config.js";
 import { buildIndex } from "./indexer.js";
 import { logger, setLogLevel } from "./logger.js";
@@ -64,6 +65,10 @@ async function main(): Promise<void> {
   // Configure HTTP connection reuse + idle reaping
   configureHttpConnector(config.connectors.httpReuseIdleTimeoutSeconds);
 
+  // Prepare the artefacts root and prune what has aged out (no-op when unconfigured).
+  // Done before indexing so a bad mount fails fast rather than at the first write.
+  initArtefacts(config.artefacts);
+
   // 2. Index all sources
   logger.info("Indexing upstream MCP sources...");
   const index = await buildIndex(config.sources);
@@ -106,6 +111,7 @@ async function main(): Promise<void> {
   const shutdown = async () => {
     logger.info("Shutdown signal received");
     stopRecovery();
+    stopArtefacts();
     await server.shutdown();
     shutdownHttp();
     killAll();

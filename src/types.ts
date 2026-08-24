@@ -12,6 +12,8 @@ export interface NexusConfig {
   connectors: ConnectorsConfig;
   search: SearchConfig;
   sources: SourceConfig[];
+  /** Absent = artefact writing is off, and `call_tool` does not advertise it */
+  artefacts?: ArtefactsConfig;
 }
 
 export interface AuthConfig {
@@ -26,6 +28,17 @@ export interface ConnectorsConfig {
   httpReuseIdleTimeoutSeconds: number;
   /** Interval (seconds) between recovery probes for failed sources. 0 = disabled. */
   recoveryIntervalSeconds: number;
+}
+
+export interface ArtefactsConfig {
+  /** Directory every artefact is written under. Nexus owns everything below it. */
+  root: string;
+  /** Delete run directories older than this. 0 = never prune. */
+  retentionDays: number;
+  /** How long an `artefacts` label keeps resolving to the same run directory. */
+  runIdleMinutes: number;
+  /** Refuse to write a single artefact larger than this. */
+  maxBytes: number;
 }
 
 export type TransportType = "http" | "stdio";

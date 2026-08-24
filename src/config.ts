@@ -97,6 +97,23 @@ const SearchConfigSchema = z.object({
   semantic: SemanticSearchConfigSchema.optional(),
 });
 
+/**
+ * Artefact writing. Omitting this block entirely disables the feature — `call_tool`
+ * then does not advertise an `artefacts` argument at all, so it costs nothing in the
+ * agent's context on deployments that have nowhere to write.
+ */
+const ArtefactsConfigSchema = z.object({
+  root: z.string().min(1),
+  retentionDays: z.number().int().min(0).max(3650).default(14),
+  runIdleMinutes: z.number().int().min(1).max(10_080).default(180),
+  maxBytes: z
+    .number()
+    .int()
+    .min(1024)
+    .max(1_073_741_824)
+    .default(32 * 1024 * 1024),
+});
+
 const NexusConfigSchema = z.object({
   port: z.number().int().min(1024).max(65535).default(8050),
   auth: AuthConfigSchema.default({ enabled: false, token: "" }),
@@ -109,6 +126,7 @@ const NexusConfigSchema = z.object({
     maxResults: 20,
   }),
   sources: z.array(SourceConfigSchema).min(1),
+  artefacts: ArtefactsConfigSchema.optional(),
 });
 
 // ─── Loader ──────────────────────────────────────────────────────────────────
@@ -160,6 +178,6 @@ export function loadConfig(userPath?: string): NexusConfig {
     throw new Error("Auth is enabled but token is empty. Set MCP_NEXUS_AUTH_TOKEN env var or provide a token in the config.");
   }
 
-  logger.info(`Loaded ${config.sources.length} source(s), auth=${config.auth.enabled}`);
+  logger.info(`Loaded ${config.sources.length} source(s), auth=${config.auth.enabled}, artefacts=${config.artefacts ? config.artefacts.root : "off"}`);
   return config;
 }

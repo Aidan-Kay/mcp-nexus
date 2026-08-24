@@ -41,6 +41,12 @@ RUN mkdir -p /app/data/model-cache && chown -R nexus:nexus /app/data
 VOLUME ["/app/data/model-cache"]
 ENV TRANSFORMERS_CACHE=/app/data/model-cache
 
+# Artefacts root (see `artefacts` in the config). Created and chowned here so that
+# Docker seeds the right ownership when it initialises an empty named volume —
+# otherwise the mountpoint arrives root-owned 755 and the non-root user cannot write.
+# A bind mount takes the host directory's ownership instead, so chown it to this uid.
+RUN mkdir -p /data/artefacts && chown -R nexus:nexus /data
+
 # Config should be mounted at runtime:
 #   -v ./mcp-nexus.yaml:/app/mcp-nexus.yaml
 # Auth token should be set via env var:

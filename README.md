@@ -120,6 +120,10 @@ sources:
 | `sources[].filter`                       | Optional glob patterns to curate which tools are indexed                                                            |
 | `sources[].preloadedTools`               | Optional array of non-prefixed tool names to surface directly in `tools/list` (e.g. `[\"search-emails\"]`)          |
 | `sources[].projections`                  | Optional default response projections, keyed by non-prefixed tool name (see [Response Shaping](#response-shaping))   |
+| `artefacts.root`                         | Directory artefacts are written under. Omit the whole `artefacts` block to disable the feature (see [Artefacts](#artefacts)) |
+| `artefacts.retentionDays`                | Delete run directories older than this, at startup and daily (default: 14; 0 = never)                               |
+| `artefacts.runIdleMinutes`               | How long a label keeps resolving to the same run directory (default: 180)                                           |
+| `artefacts.maxBytes`                     | Refuse to write a single artefact larger than this (default: 33554432)                                              |
 
 ## Search
 
@@ -191,7 +195,7 @@ The nexus exposes these tools to connected AI agents:
 | `browse_tools`    | List all tools for a specific service (namespaced names)               |
 | `search_tools`    | Search for tools by keyword (lexical) or natural language (semantic)   |
 | `get_schemas`     | Get input schemas and inferred response shapes for one or more tools   |
-| `call_tool`       | Call a tool on an upstream service, optionally trimming the response   |
+| `call_tool`       | Call a tool on an upstream service, optionally trimming the response or writing it to a file |
 | `index`           | Diagnostic — shows index summary, source availability, and error info  |
 
 Additionally, any tools listed under `preloadedTools` on a source will appear directly in the `tools/list` response alongside the built-in nexus tools — no browsing needed.
@@ -233,6 +237,71 @@ returned, learned from calls as they pass through. Its size is fixed regardless 
 how many records came back. If a tool hasn't been called yet, make one small call
 first (most take a `limit` or `pageSize`) and the shape will be recorded.
 
+## Artefacts
+
+Projections trim a response; artefacts remove it from the conversation altogether.
+When a result is only ever going to be aggregated by code — a full orders feed, a
+whole catalogue — passing an `artefacts` label writes it to a file and returns a
+receipt instead:
+
+```jsonc
+{
+  "toolName": "ebay__ebay_get_orders",
+  "parameters": { "limit": 25, "offset": 50 },
+  "artefacts": "ebay-weekly-review"
+}
+```
+
+```jsonc
+{
+  "artefact": {
+    "run": "20260824-161204-ebay-weekly-review",
+    "dir": "/data/artefacts/20260824-161204-ebay-weekly-review",
+    "path": "/data/artefacts/20260824-161204-ebay-weekly-review/ebay_get_orders-a3f1c92b.json",
+    "bytes": 18206,
+    "records": 25,
+    "recordPath": "orders",
+    "shape": ["total: number", "orders[*].lineItems[*].legacyItemId: string", "…"]
+  }
+}
+```
+
+The agent then runs code against `dir`. Nothing about the payload enters its context.
+
+This requires a code executor that can see the same absolute path — mount one
+volume into both containers at the same location. Read-only on the executor's side
+is the cleanest arrangement: artefacts are the nexus's output and its input.
+
+**`artefacts` is a label, not a path.** The caller names the task; the nexus builds
+the directory name from a timestamp and the label reduced to `[a-z0-9-]`, and
+resolves it strictly under `root`. Every call sharing a label lands in one
+directory until it has been idle for `runIdleMinutes`, so a multi-call pull needs no
+coordination — and last week's run can never be read as this week's.
+
+**Filenames are derived from the tool and a digest of its arguments**, so a retried
+page overwrites itself instead of leaving a duplicate for the aggregation to
+double-count.
+
+**`records` is the count of the largest top-level array**, reported per file so a
+caller can check that pages sum to the expected total without opening anything. A
+page past the end of a feed reports `0` rather than going missing.
+
+**Projections still apply.** The context argument for trimming disappears, but the
+reason to keep buyer addresses out of a response is not that they are expensive.
+`select` still overrides a configured projection, and `shape` describes what is
+actually in the file — not the wider upstream response, which `get_schemas` still
+reports in full.
+
+**Errors are never written to a file.** Transport failures, upstream tool errors and
+unmatched `select` paths all come back inline, as they do without a label. If the
+*write* fails, the call returns an error naming the path and errno — the payload is
+deliberately not returned instead, since dumping a whole feed into the context is
+the failure the caller was avoiding.
+
+Preloaded tools take no `artefacts` argument (or `select`), since they are dispatched
+with the upstream schema verbatim. A tool wide enough to want either should be
+reached through `call_tool`.
+
 ## Architecture
 
 ```
@@ -258,6 +327,7 @@ src/
   namespace.ts          Tool name namespacing (<sourceId>__<toolName>)
   glob-utils.ts         Glob pattern matching for tool filtering
   indexer.ts            Startup index — fetches tools/list from all sources
+  artefacts.ts          Run directories, artefact writing, retention
   recovery.ts           Background recovery probes for failed sources
   nexus-server.ts       MCP server — tool definitions and request handling
   sources/

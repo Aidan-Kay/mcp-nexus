@@ -12,10 +12,11 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { resolveRun, writeArtefact, type ArtefactResult } from "./artefacts.js";
 import { updateSourceInIndex } from "./indexer.js";
 import { logger } from "./logger.js";
 import { namespaceTool, parseNamespacedName } from "./namespace.js";
-import { inferShape, minifyContent, project, relevantShape, replaceJsonBlock, resolveJsonBlock, textOf } from "./projection.js";
+import { inferShape, minifyContent, project, relevantShape, replaceJsonBlock, resolveJsonBlock, textOf, type ContentBlock } from "./projection.js";
 import type { SearchEngine } from "./search/index.js";
 import type { NexusConfig, NexusIndex, UpstreamCallResult } from "./types.js";
 
@@ -283,11 +284,21 @@ export class NexusServer {
     );
 
     // ─── call_tool ─────────────────────────────────────────────────────────
+    //
+    // The `artefacts` argument only exists when a root is configured. A nexus with
+    // nowhere to write must not advertise the option — the schema is read by every
+    // agent on every session, so an unusable argument is a permanent context cost
+    // and an invitation to call something that can only fail.
+    const artefactsEnabled = Boolean(this.config.artefacts);
+
     mcpServer.registerTool(
       "call_tool",
       {
         description:
-          "Call a tool on an upstream MCP service. Pass the namespaced tool name (e.g. 'todoist__get-task') and its parameters. The response is passed through from the upstream service. Use 'select' to trim wide responses down to the fields you need — get_schemas reports a 'responseShape' you can write those paths from.",
+          "Call a tool on an upstream MCP service. Pass the namespaced tool name (e.g. 'todoist__get-task') and its parameters. The response is passed through from the upstream service. Use 'select' to trim wide responses down to the fields you need — get_schemas reports a 'responseShape' you can write those paths from." +
+          (artefactsEnabled
+            ? " For results too large to be worth reading — a full orders feed, a whole catalogue — pass 'artefacts' instead: the response is written to a file and you get back its path, size and record count rather than the data."
+            : ""),
         inputSchema: {
           toolName: z.string().describe("The namespaced tool name to call (e.g. 'todoist__get-task')"),
           // ⚠️ Value type is spelled out explicitly rather than using z.unknown().
@@ -308,9 +319,29 @@ export class NexusServer {
             .describe(
               "Optional dotted paths to trim the response to, e.g. ['total', 'inventoryItems[*].sku', 'inventoryItems[*].product.title']. '[*]' maps over an array. Nesting is preserved. A path that matches nothing is reported as an error rather than returned as absent data, so a typo cannot look like a missing field.",
             ),
+          ...(artefactsEnabled
+            ? {
+                artefacts: z
+                  .string()
+                  .min(1)
+                  .max(64)
+                  .optional()
+                  .describe(
+                    "Optional label for the task this call belongs to, e.g. 'ebay-weekly-review'. Writes the result to a file instead of returning it, and returns { path, bytes, records } — the data never enters your context. Pass the same label on every call in the task and they all land in one directory, whose path comes back as 'dir' for the code that reads them. This is a label, not a path: the directory name is chosen for you. Errors are always returned inline, never written.",
+                  ),
+              }
+            : {}),
         },
       },
-      async ({ toolName, parameters = {}, select }) => this.executeCallTool(toolName, parameters, select),
+      async (args) => {
+        const { toolName, parameters = {}, select, artefacts } = args as {
+          toolName: string;
+          parameters?: Record<string, unknown>;
+          select?: string[];
+          artefacts?: string;
+        };
+        return this.executeCallTool(toolName, parameters, select, artefacts);
+      },
     );
 
     // ─── index (diagnostic) ────────────────────────────────────────────────
@@ -514,6 +545,7 @@ export class NexusServer {
     toolName: string,
     parameters: Record<string, unknown>,
     select?: string[],
+    artefacts?: string,
   ): Promise<CallToolResult> {
     if (!toolName) {
       return { content: [{ type: "text", text: "Missing required parameter: toolName" }], isError: true };
@@ -623,7 +655,11 @@ export class NexusServer {
           isError: true,
         };
       }
-      return { content: minifyContent(result.content) as CallToolResult["content"], structuredContent: result.structuredContent };
+      const passthrough = minifyContent(result.content);
+      if (artefacts) {
+        return this.writeArtefactResult(artefacts, parsed.toolName, parameters, select, payload, passthrough, []);
+      }
+      return { content: passthrough as CallToolResult["content"], structuredContent: result.structuredContent };
     }
 
     const { result: projected, unmatched } = project(payload, paths);
@@ -663,20 +699,95 @@ export class NexusServer {
     // the projection just saved, so misses go to the log for whoever wrote the config.
     // Only a projection that matched *nothing* is worth telling the caller about, because
     // then the response it is holding is empty.
+    const notes: string[] = [];
     if (unmatched.length > 0) {
       logger.warn(`Projection for ${toolName} skipped unmatched paths: ${unmatched.join(", ")}`);
 
       if (unmatched.length === paths.length) {
-        content.push({
-          type: "text",
-          text: `Note: the configured projection for this tool matched nothing — none of these paths exist upstream: ${unmatched.join(", ")}`,
-        });
+        notes.push(`the configured projection for this tool matched nothing — none of these paths exist upstream: ${unmatched.join(", ")}`);
+        content.push({ type: "text", text: `Note: ${notes[0]}` });
       }
+    }
+
+    if (artefacts) {
+      // The note travels with the receipt rather than the content, or a projection
+      // that has drifted would write an empty file and say nothing about it.
+      return this.writeArtefactResult(artefacts, parsed.toolName, parameters, select, projected, content, notes);
     }
 
     return {
       content: content as CallToolResult["content"],
       structuredContent: result.structuredContent ? (projected as Record<string, unknown>) : undefined,
+    };
+  }
+
+  /**
+   * Write a successful result to the artefacts directory and return a receipt.
+   *
+   * Only reached on success: transport errors, upstream tool failures and unmatched
+   * `select` paths have all returned inline before this point, because an error
+   * written to a file is an error nobody reads.
+   */
+  private writeArtefactResult(
+    label: string,
+    toolName: string,
+    parameters: Record<string, unknown>,
+    select: string[] | undefined,
+    payload: unknown,
+    content: ContentBlock[],
+    notes: string[],
+  ): CallToolResult {
+    const config = this.config.artefacts;
+    if (!config) {
+      return {
+        content: [{ type: "text", text: "This nexus has no artefacts root configured, so 'artefacts' cannot be used. Retry without it." }],
+        isError: true,
+      };
+    }
+
+    const text = payload === undefined ? textOf(content) : "";
+    if (payload === undefined && text.trim() === "") {
+      return {
+        content: [{ type: "text", text: `Nothing to write for ${toolName}: the response carried no JSON payload and no text. Retry without 'artefacts'.` }],
+        isError: true,
+      };
+    }
+
+    let artefact: ArtefactResult;
+    try {
+      const run = resolveRun(config, label);
+      artefact = writeArtefact(config, run, { toolName, parameters, select, payload, text });
+    } catch (err) {
+      // Deliberately not falling back to returning the payload: a disk failure on a
+      // wide response would put the whole thing into context at exactly the moment
+      // the caller was trying to keep it out — and would do so on every page at once.
+      const code = (err as NodeJS.ErrnoException).code;
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: `could not write artefact for ${toolName}`,
+              reason: err instanceof Error ? err.message : String(err),
+              code,
+              root: config.root,
+              hint: "the result was not returned and not saved — fix the artefacts mount and retry",
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // Anything that is not text (images, embedded resources) has no file
+    // representation here, so it still rides back inline alongside the receipt.
+    const nonText = content.filter((block) => block.type !== "text");
+
+    return {
+      content: [
+        { type: "text", text: JSON.stringify({ artefact, notes: notes.length > 0 ? notes : undefined }) },
+        ...nonText,
+      ] as CallToolResult["content"],
     };
   }
 

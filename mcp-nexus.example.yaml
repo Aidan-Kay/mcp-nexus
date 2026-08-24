@@ -28,6 +28,15 @@ search:
   #   # model: text-embedding-3-small
   #   # apiKeyEnv: OPENAI_API_KEY # Name of env var containing the API key
 
+# artefacts: # Uncomment to let call_tool write results to files instead of returning them.
+#   root: /data/artefacts # Every artefact lives under here; nexus owns the paths below it
+#   retentionDays: 14 # Delete run directories older than this (0 = never)
+#   runIdleMinutes: 180 # How long one label keeps writing into the same run directory
+#   maxBytes: 33554432 # Refuse to write a single artefact larger than this (32 MB)
+#
+# Whatever executes code against these files must see the same absolute path —
+# mount the same volume at the same location in both containers.
+
 sources:
   - id: todoist
     name: Todoist
