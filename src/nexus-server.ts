@@ -38,6 +38,13 @@ const SERVER_VERSION = pkg.version;
 const MCP_PROTOCOL_VERSION = DEFAULT_NEGOTIATED_PROTOCOL_VERSION;
 
 /**
+ * call_tool's own arguments. `parameters` is an open record, so nesting one of
+ * these inside it validates cleanly and is then forwarded upstream as if it were
+ * a tool argument — see checkMisplacedArguments.
+ */
+const NEXUS_CALL_ARGS = ["select", "artefacts", "toolName"] as const;
+
+/**
  * Sends a JSON-RPC error response with the mcp-protocol-version header.
  * Used for pre-transport errors (auth, body size, parse) that bypass the SDK.
  */
@@ -311,13 +318,15 @@ export class NexusServer {
             .record(z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(z.any()), z.record(z.any())]))
             .optional()
             .describe(
-              "The parameters to pass to the tool, matching its input schema. Pass each value with its native JSON type (e.g. 25, not {\"value\": 25}).",
+              "The upstream tool's own arguments, matching its input schema. Pass each value with its native JSON type (e.g. 25, not {\"value\": 25}). Only that tool's arguments belong here — " +
+                (artefactsEnabled ? "'select' and 'artefacts' are" : "'select' is") +
+                " passed alongside this object, not inside it.",
             ),
           select: z
             .array(z.string())
             .optional()
             .describe(
-              "Optional dotted paths to trim the response to, e.g. ['total', 'inventoryItems[*].sku', 'inventoryItems[*].product.title']. '[*]' maps over an array. Nesting is preserved. A path that matches nothing is reported as an error rather than returned as absent data, so a typo cannot look like a missing field.",
+              "Optional dotted paths to trim the response to — an argument of call_tool itself, passed alongside 'parameters' rather than inside it. For example ['total', 'inventoryItems[*].sku', 'inventoryItems[*].product.title']. '[*]' maps over an array. Nesting is preserved. A path that matches nothing is reported as an error rather than returned as absent data, so a typo cannot look like a missing field.",
             ),
           ...(artefactsEnabled
             ? {
@@ -327,7 +336,7 @@ export class NexusServer {
                   .max(64)
                   .optional()
                   .describe(
-                    "Optional label for the task this call belongs to, e.g. 'ebay-weekly-review'. Writes the result to a file instead of returning it, and returns { path, bytes, records } — the data never enters your context. Pass the same label on every call in the task and they all land in one directory, whose path comes back as 'dir' for the code that reads them. This is a label, not a path: the directory name is chosen for you. Errors are always returned inline, never written.",
+                    "Optional label for the task this call belongs to, e.g. 'ebay-weekly-review' — an argument of call_tool itself, passed alongside 'parameters' rather than inside it. Writes the result to a file instead of returning it, and returns { path, bytes, records } — the data never enters your context. Pass the same label on every call in the task and they all land in one directory, whose path comes back as 'dir' for the code that reads them. This is a label, not a path: the directory name is chosen for you. Errors are always returned inline, never written.",
                   ),
               }
             : {}),
@@ -580,6 +589,26 @@ export class NexusServer {
       };
     }
 
+    // A nexus argument nested inside `parameters` is a caller mistake that would
+    // otherwise pass silently, so check before the call rather than after.
+    const misplaced = this.checkMisplacedArguments(indexed.tool, parameters);
+    if (misplaced.length > 0) {
+      const example = misplaced[0] === "select" ? '["field"]' : '"value"';
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: `these are arguments of call_tool itself, not parameters of ${toolName}: ${misplaced.join(", ")}`,
+              misplaced,
+              hint: `move them out of 'parameters' and pass them alongside it — { "toolName": "${toolName}", "parameters": {...}, "${misplaced[0]}": ${example} }`,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+
     // Route to the right transport
     const caller = source.config.transport === "http" ? httpCallTool : stdioCallTool;
     const result: UpstreamCallResult = await caller(source.config, parsed.toolName, parameters);
@@ -789,6 +818,27 @@ export class NexusServer {
         ...nonText,
       ] as CallToolResult["content"],
     };
+  }
+
+  /**
+   * Detect call_tool's own arguments nested inside `parameters`.
+   *
+   * `parameters` is an open record, so `{ parameters: { limit: 25, select: [...] } }`
+   * validates and the stray key is forwarded upstream. The service then ignores it,
+   * and the caller believes a projection was applied that never reached the nexus at
+   * all — a wrong answer with nothing to show it was wrong, which is the failure
+   * `select`'s unmatched-path error exists to prevent.
+   *
+   * Checked against the upstream tool's declared properties rather than by name
+   * alone, so a service with a genuine parameter called `select` still works. A tool
+   * declaring no properties is left alone: there is nothing to check it against, and
+   * guessing would break open-schema tools that accept arbitrary keys.
+   */
+  private checkMisplacedArguments(tool: McpTool, parameters: Record<string, unknown>): string[] {
+    const declared = (tool.inputSchema as { properties?: Record<string, unknown> } | undefined)?.properties;
+    if (!declared || typeof declared !== "object") return [];
+
+    return NEXUS_CALL_ARGS.filter((name) => name in parameters && !(name in declared));
   }
 
   /**
