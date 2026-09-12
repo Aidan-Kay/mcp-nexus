@@ -18,6 +18,10 @@ call_tool("todoist__get-task", {id: "123"}) → result
 
 Agents can either **browse** (list services → list tools) or **search** (find tools by keyword or semantic similarity across all services at once).
 
+The service roster itself costs no tool call at all: the nexus renders it into the `instructions` field of the MCP `initialize` response, which clients inject into the model's system prompt. An agent knows which services exist, what each covers, and how many tools each carries before it makes a single request — `browse_services` remains for clients that ignore `instructions`, and for checking live availability.
+
+Instructions are sent once per session and cannot be revised afterwards, so only durable facts go into them. Availability shifts as the recovery poller re-probes failed sources, which is why status stays in `browse_services` and `index`.
+
 ## Quick Start
 
 ### Prerequisites

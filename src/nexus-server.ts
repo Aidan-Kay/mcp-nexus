@@ -150,6 +150,40 @@ export class NexusServer {
     this.httpServer = this.createHttpServer();
   }
 
+  /**
+   * Render the `instructions` string returned in the initialize result.
+   *
+   * Clients inject this into the model's system prompt, so the service roster is
+   * known before the first tool call — `browse_services` becomes a fallback for
+   * clients that ignore instructions rather than a mandatory opening move.
+   *
+   * ⚠️ Instructions are sent once, in the initialize response, and no
+   * notification exists to revise them. Anything volatile written here stays
+   * wrong for the rest of the session: the recovery poller flips availability
+   * every `recoveryIntervalSeconds`, so live status belongs in `browse_services`
+   * and `index`, which are called at the moment the answer matters. Only what
+   * outlives a session goes here — which services exist and what each covers —
+   * and a source that was down at index time is named as such rather than
+   * quietly reported as having no tools.
+   */
+  private renderInstructions(): string {
+    const roster = Array.from(this.index.sources.values()).map((state) => {
+      const { id, name, description } = state.config;
+      const detail = state.tools.length > 0 ? `${state.tools.length} tools` : "unavailable at session start";
+      return `- ${id} (${name}) — ${description} [${detail}]`;
+    });
+
+    return [
+      "mcp-nexus fronts several upstream MCP services behind one set of tools. Configured services:",
+      "",
+      roster.length > 0 ? roster.join("\n") : "- (none indexed)",
+      "",
+      "That roster is a snapshot taken when this session opened — call `index` for current availability. " +
+        "Use `search_tools` to find a tool by what you want to do, `browse_tools` to list one service's tools, " +
+        "`get_schemas` before calling an unfamiliar tool, and `call_tool` to invoke it.",
+    ].join("\n");
+  }
+
   /** Register the 6 nexus management tools with the given SDK McpServer instance */
   private registerNexusTools(mcpServer: McpServer): void {
     // ─── browse_services ───────────────────────────────────────────────────
@@ -1046,7 +1080,13 @@ export class NexusServer {
       };
 
       // Create a fresh McpServer for this session and register all tools
-      const mcpServer = new McpServer({ name: "mcp-nexus", version: SERVER_VERSION }, { capabilities: { tools: { listChanged: true } } });
+      // Instructions are rendered here, not at startup: this runs inside the
+      // initialize handler, so the roster reflects the index as it stands when
+      // the client actually connects.
+      const mcpServer = new McpServer(
+        { name: "mcp-nexus", version: SERVER_VERSION },
+        { capabilities: { tools: { listChanged: true } }, instructions: this.renderInstructions() },
+      );
       this.registerNexusTools(mcpServer);
       this.installToolsListHandler(mcpServer);
 
