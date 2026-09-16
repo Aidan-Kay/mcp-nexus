@@ -348,8 +348,12 @@ export class NexusServer {
           // pydantic model builder, grammar-constrained decoders) misread as
           // "object with no properties", silently replacing every scalar argument
           // with {}. Enumerating the permitted JSON types removes the ambiguity.
+          // The element type is z.unknown(), not z.any(): z.any() emits a bare
+          // `{ type: "array" }` with no `items`, which VS Code rejects outright
+          // ("array type must have items"). z.unknown() emits `items: {}` and
+          // stays permissive, so nested arrays still pass through.
           parameters: z
-            .record(z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(z.any()), z.record(z.any())]))
+            .record(z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(z.unknown()), z.record(z.any())]))
             .optional()
             .describe(
               "The upstream tool's own arguments, matching its input schema. Pass each value with its native JSON type (e.g. 25, not {\"value\": 25}). Only that tool's arguments belong here — " +
