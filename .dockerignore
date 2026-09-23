@@ -1,6 +1,9 @@
-node_modules
-dist
-*.yaml
-!mcp-nexus.prod.yaml
-.git
-*.md
+# An allowlist rather than a denylist. The context is now the working tree, and
+# a local one holds mcp-nexus.yaml and mcp-nexus.dev.yaml - real service URLs
+# and tokens - plus md/ notes. All gitignored, so CI never has them, but a
+# denylist that missed one would put it in a local image without complaint.
+*
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/

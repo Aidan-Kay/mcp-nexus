@@ -170,6 +170,10 @@ If the semantic provider fails at query time (e.g. Ollama is down), the search e
 
 ## Docker
 
+CI builds the image from each commit on `main` and publishes it as
+`ghcr.io/aidan-kay/mcp-nexus`, tagged `latest` and with the commit SHA. A local build
+copies the working tree, so it builds what is on disk, uncommitted changes included.
+
 ```bash
 # Build
 npm run docker:build

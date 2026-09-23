@@ -1,0 +1,61 @@
+name: ci
+
+# There was no CI before this: firelink built the image itself from a clone of
+# main. Now a push is typechecked here and the image is built here, and
+# firelink only pulls it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # 22, matching the image's base. Checking on a newer Node than the one
+      # that runs it would pass code the container cannot load.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+
+      # No test suite exists yet, so the compiler is the whole check. It is
+      # still the one that matters most: the image's own build step is tsc.
+      - run: npx tsc --noEmit
+
+  image:
+    runs-on: ubuntu-latest
+    needs: checks
+    # Only main is pushed; a PR proves the build.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Sign in to GHCR
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: ${{ github.ref == 'refs/heads/main' }}
+          # latest for the ordinary deploy; the SHA to roll back to, and to
+          # check a deploy against.
+          tags: |
+            ghcr.io/aidan-kay/mcp-nexus:${{ github.sha }}
+            ghcr.io/aidan-kay/mcp-nexus:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,17 +1,22 @@
 # ─── Build Stage ───────────────────────────────────────────────────────────────
 FROM node:22-slim AS builder
 
-# git + ca-certificates are required to fetch the repository over HTTPS
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends git ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
-# Clone the repository (shallow clone — no history needed)
-RUN git clone --depth 1 https://github.com/Aidan-Kay/mcp-nexus.git .
+# The source arrives from the build context, not from a `git clone`. CI builds
+# this image from its own checkout and firelink pulls it by tag, so a clone
+# would fetch over the network what is already in the context - and Docker
+# caches a clone layer on the URL alone, so a new commit on main was silently
+# not built without --no-cache. Copying builds the commit in hand.
 
-RUN npm install
+# Manifests first, so the dependency layer is keyed on them alone and editing
+# a source file does not reinstall node_modules. `ci` rather than `install`:
+# the lockfile is the build, not a suggestion to it.
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY tsconfig.json ./
+COPY src/ ./src/
 RUN npx tsc
 # Prune dev dependencies so runtime only has production deps (with native binaries intact)
 RUN npm prune --omit=dev
@@ -28,6 +33,13 @@ RUN apt-get update && \
 
 # Create non-root user
 RUN groupadd -r nexus && useradd -r -g nexus nexus
+
+# Filesystem MCP server — launched by nexus as a stdio source (the `files` source in
+# mcp-nexus.yaml), sandboxed to /data/lyra. Installed into the image rather than fetched
+# at runtime with `npx -y`: the container has no writable $HOME, so npx has nowhere to
+# put its cache and the source would fail to start. Pinned deliberately — this package
+# can write files on Lyra's behalf.
+RUN npm install -g @modelcontextprotocol/server-filesystem@2026.7.10
 
 COPY --from=builder /app/package.json /app/package-lock.json ./
 COPY --from=builder /app/node_modules/ ./node_modules/
@@ -52,6 +64,9 @@ RUN mkdir -p /data/artefacts && chown -R nexus:nexus /data
 # Auth token should be set via env var:
 #   -e MCP_NEXUS_AUTH_TOKEN=<token>
 
+# NOTE: docker-compose.yml overrides this with user: "1000:1000" so that artefacts and
+# scripts are owned by aidan on the host. Kept as a sane non-root default for any run
+# that does not set `user:`.
 USER nexus
 
 EXPOSE 8050
