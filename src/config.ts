@@ -64,6 +64,10 @@ const SemanticSearchConfigSchema = z
     apiKeyEnv: z.string().optional(),
     batchSize: z.number().int().min(1).max(256).default(32),
     modelCachePath: z.string().optional(),
+    // Calibrated for all-MiniLM-L6-v2: the right tool scored 0.35-0.83 over a probe set,
+    // queries nothing should match topped out at 0.15. 0.25 leaves room below the
+    // weakest correct hit without letting those in. Other models use other scales.
+    minSimilarity: z.number().min(0).max(1).default(0.25),
   })
   .superRefine((s, ctx) => {
     if (s.provider === "ollama" && !s.baseUrl) {

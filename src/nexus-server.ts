@@ -20,6 +20,7 @@ import { inferShape, minifyContent, project, relevantShape, replaceJsonBlock, re
 import type { SearchEngine } from "./search/index.js";
 import type { IndexedTool, NexusConfig, NexusIndex, UpstreamCallResult } from "./types.js";
 import { validateArguments } from "./validation.js";
+import { compactSchema } from "./compact-schema.js";
 
 // Transport-specific callers
 import { callTool as httpCallTool, fetchTools as httpFetchTools } from "./sources/http-source.js";
@@ -180,16 +181,13 @@ export class NexusServer {
       roster.length > 0 ? roster.join("\n") : "- (none indexed)",
       "",
       "That roster is a snapshot taken when this session opened — call `index` for current availability. " +
-        "Use `search_tools` to find a tool by what you want to do — each hit carries its full schema, so you can " +
-        "`call_tool` straight from the results. `browse_tools` lists one service's tools by name; call `get_schemas` " +
-        "for any you pick from there before invoking them.",
+        "Use `search_tools` to find a tool by what you want to do — each hit carries its schema, so you can " +
+        "`call_tool` straight from the results unless the hit lists `inputSchemaTrimmed`. Call `get_schemas` for " +
+        "those, and for any tool you pick from `browse_tools`, which lists names only.",
     ].join("\n");
   }
 
-  /**
-   * What an agent needs to call a tool: shared by get_schemas and search_tools so the
-   * two cannot disagree about a tool's schema.
-   */
+  /** Everything get_schemas knows about a tool — search_tools returns a compact subset. */
   private describeTool(name: string, indexed: IndexedTool) {
     return {
       description: indexed.tool.description,
@@ -258,8 +256,8 @@ export class NexusServer {
     // queries (semantic). The strategy is fixed at startup via config.
     const isSemantic = this.config.search.type === "semantic";
     const searchDescription = isSemantic
-      ? "Search for tools across all services (or within a single service) by semantic similarity. Returns matching tools ranked by relevance, each with its description, full inputSchema and — once the tool has been called — its responseShape, so no get_schemas call is needed before call_tool. Use natural-language queries describing what you want to do (e.g. 'I want to send an email', 'find tools for managing my inbox')."
-      : "Search for tools across all services (or within a single service) by keyword matching. Returns matching tools ranked by relevance, each with its description, full inputSchema and — once the tool has been called — its responseShape, so no get_schemas call is needed before call_tool. Use concise keywords that appear in tool names or descriptions (e.g. 'send email', 'ebay orders', 'create task').";
+      ? "Search for tools across all services (or within a single service) by semantic similarity. Returns matching tools ranked by relevance, each with its description, inputSchema and — once the tool has been called — its responseShape. Structured arguments (nested objects, arrays of objects) are cut to their type and named in inputSchemaTrimmed: call get_schemas for those tools; any other hit can go straight to call_tool. Only tools similar enough to count as a match are returned, so an empty result means nothing matched: rephrase the query rather than assume the tool does not exist. Use natural-language queries describing what you want to do (e.g. 'I want to send an email', 'find tools for managing my inbox')."
+      : "Search for tools across all services (or within a single service) by keyword matching. Returns matching tools ranked by relevance, each with its description, inputSchema and — once the tool has been called — its responseShape. Structured arguments (nested objects, arrays of objects) are cut to their type and named in inputSchemaTrimmed: call get_schemas for those tools; any other hit can go straight to call_tool. Use concise keywords that appear in tool names or descriptions (e.g. 'send email', 'ebay orders', 'create task').";
     const queryDescription = isSemantic
       ? "Search query — natural language description of what you want to do (e.g. 'I want to send an email', 'find tools for managing my inbox')"
       : "Search query — keywords that appear in tool names or descriptions (e.g. 'send email', 'ebay orders', 'create task')";
@@ -279,13 +277,25 @@ export class NexusServer {
         }
 
         const { results, ...rest } = await this.searchEngine.search(query, serviceId);
-        // Every hit carries what get_schemas would have said about it: the round trip
-        // between finding a tool and calling it was the common case, not the exception.
-        // A hit whose tool left the index mid-search (a re-index) is dropped rather
-        // than returned without the schema it promises.
+        // Every hit carries enough to call it: the round trip between finding a tool and
+        // calling it was the common case, not the exception. The schema is compacted so
+        // a few Graph-sized entities cannot swamp a search; outputSchema is left to
+        // get_schemas for the same reason. A hit whose tool left the index mid-search
+        // (a re-index) is dropped rather than returned without the schema it promises.
         const hits = results.flatMap(({ name, serviceId }) => {
           const indexed = this.index.tools.get(name);
-          return indexed ? [{ name, serviceId, ...this.describeTool(name, indexed) }] : [];
+          if (!indexed) return [];
+          const { schema, trimmed } = compactSchema(indexed.tool.inputSchema);
+          return [
+            {
+              name,
+              serviceId,
+              description: indexed.tool.description,
+              inputSchema: schema,
+              inputSchemaTrimmed: trimmed,
+              responseShape: this.responseShapes.get(name),
+            },
+          ];
         });
 
         return { content: [{ type: "text", text: JSON.stringify({ ...rest, results: hits }) }] };

@@ -60,7 +60,8 @@ export class SearchEngine {
     try {
       const queryEmbedding = await this.provider.embed(query);
       const scored = this.embeddingIndex.search(queryEmbedding, serviceId);
-      return this.formatResult(query, scored, max, "semantic", false);
+      const floor = this.config.semantic?.minSimilarity ?? 0;
+      return this.formatResult(query, scored, max, "semantic", false, floor);
     } catch (err) {
       logger.warn(`Semantic search failed — falling back to lexical: ${err instanceof Error ? err.message : String(err)}`);
       return this.runLexical(query, serviceId, max, "semantic", true);
@@ -84,14 +85,20 @@ export class SearchEngine {
     max: number,
     strategy: "lexical" | "semantic",
     fellBack: boolean,
+    matchFloor = 0,
   ): SearchResult {
-    const truncated = scored.length > max;
-    const results = scored.slice(0, max).map(({ name, serviceId }) => ({ name, serviceId }));
+    // The floor bounds both the count and the results: a tool below it is not a match,
+    // so it is neither counted nor returned, and a query nothing resembles comes back
+    // empty — which the caller reads as "rephrase" — rather than as five weak guesses.
+    const matches = scored.filter((s) => s.score >= matchFloor);
+    const truncated = matches.length > max;
+    const results = matches.slice(0, max).map(({ name, serviceId }) => ({ name, serviceId }));
+    const totalMatches = matches.length;
 
     return {
       query,
       results,
-      totalMatches: scored.length,
+      totalMatches,
       truncated: truncated || undefined,
       strategy,
       fellBackToLexical: fellBack || undefined,

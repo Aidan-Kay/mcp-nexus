@@ -28,6 +28,8 @@ export interface SemanticSearchConfig {
   batchSize: number;
   /** Where to store the downloaded model (built-in provider only) */
   modelCachePath?: string;
+  /** Cosine similarity a tool must reach to be returned or counted at all */
+  minSimilarity: number;
 }
 
 // ─── Embedding Provider Interface ────────────────────────────────────────────
@@ -54,6 +56,11 @@ export interface ScoredResult {
 export interface SearchResult {
   query: string;
   results: Array<{ name: string; serviceId: string }>;
+  /**
+   * Lexical: tools matching at least one query word. Semantic: tools at or above
+   * minSimilarity — every tool has *some* similarity, so counting all of them would
+   * report the size of the index rather than how well the query was answered.
+   */
   totalMatches: number;
   truncated?: boolean;
   /** Which search strategy was used (for logging/debugging) */

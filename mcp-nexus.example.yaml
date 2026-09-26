@@ -18,6 +18,7 @@ search:
   #   model: Xenova/all-MiniLM-L6-v2 # Model name (provider-specific)
   #   batchSize: 32 # Batch size for embedding generation at index time
   #   modelCachePath: /app/data/model-cache # Where to cache the model (built-in only)
+  #   minSimilarity: 0.25 # Similarity a tool needs to be returned at all (model-specific)
   #   # For ollama:
   #   # provider: ollama
   #   # baseUrl: http://ollama:11434

@@ -12,7 +12,7 @@ Instead of connecting every MCP server directly (and loading all their tool sche
 browse_services              → [{id: "todoist", name: "Todoist"}, {id: "outlook", ...}]
 browse_tools("todoist")      → ["todoist__get-task", "todoist__create-task", ...]
 search_tools("send email")   → [{name: "outlook__search-emails", serviceId: "outlook", inputSchema: {...}}, ...]
-get_schemas(["todoist__get-task"])  → [full input schema]   (for tools found by browsing)
+get_schemas(["todoist__get-task"])  → [full input schema]   (for browsed tools, or a hit with inputSchemaTrimmed)
 call_tool("todoist__get-task", {id: "123"}) → result
 ```
 
@@ -117,6 +117,7 @@ sources:
 | `search.semantic.apiKeyEnv`              | Name of env var containing the API key (required for `openai-compatible`)                                           |
 | `search.semantic.batchSize`              | Batch size for embedding generation at index time (default: 32)                                                     |
 | `search.semantic.modelCachePath`         | Where to cache the downloaded model (`built-in` provider only)                                                      |
+| `search.semantic.minSimilarity`          | Cosine similarity a tool must reach to be returned at all (default: 0.25, calibrated for all-MiniLM-L6-v2)           |
 | `sources[].id`                           | Unique identifier for the source (used in namespaced tool names)                                                    |
 | `sources[].transport`                    | `"http"` for Streamable HTTP, `"stdio"` for subprocess                                                              |
 | `sources[].url`                          | Upstream MCP server URL (required for HTTP transport)                                                               |
@@ -131,7 +132,11 @@ sources:
 
 ## Search
 
-The `search_tools` tool lets agents find tools by query instead of browsing every service. Two strategies are available, configured at startup via `search.type`:
+The `search_tools` tool lets agents find tools by query instead of browsing every service. Every hit carries its description, `responseShape` (once the tool has been called) and a **compact** input schema: each top-level argument is kept whole when it is simple — scalars, enums, arrays and maps of scalars — and a structured one (a nested object, an array of objects, a `$ref`) is cut to its type and description and named in `inputSchemaTrimmed`. A hit without `inputSchemaTrimmed` has its complete schema and can go straight to `call_tool`; one with it needs `get_schemas` first. This keeps a search over Graph-backed tools, whose schemas embed whole message and event entities, from costing thousands of tokens.
+
+`totalMatches` counts real matches rather than tools scanned. Under lexical search that is every tool matching a query word. Under semantic search every tool has *some* similarity, so only those at or above `search.semantic.minSimilarity` are counted or returned: a search may come back with fewer than `maxResults` hits, and a query nothing resembles comes back empty rather than padded with weak guesses.
+
+Two strategies are available, configured at startup via `search.type`:
 
 ### Lexical (default)
 
@@ -203,7 +208,7 @@ The nexus exposes these tools to connected AI agents:
 | ----------------- | ---------------------------------------------------------------------- |
 | `browse_services` | List all available upstream services with descriptions and tool counts |
 | `browse_tools`    | List all tools for a specific service (namespaced names)               |
-| `search_tools`    | Search for tools by keyword (lexical) or natural language (semantic); every hit carries its full schema |
+| `search_tools`    | Search for tools by keyword (lexical) or natural language (semantic); every hit carries a compact schema |
 | `get_schemas`     | Get input schemas and inferred response shapes for one or more tools   |
 | `call_tool`       | Call a tool on an upstream service, optionally trimming the response or writing it to a file. Arguments are checked against the tool's input schema first; a mismatch is refused with the problems and the schema |
 | `index`           | Diagnostic — shows index summary, source availability, and error info  |
