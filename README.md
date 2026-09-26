@@ -11,8 +11,8 @@ Instead of connecting every MCP server directly (and loading all their tool sche
 ```
 browse_services              → [{id: "todoist", name: "Todoist"}, {id: "outlook", ...}]
 browse_tools("todoist")      → ["todoist__get-task", "todoist__create-task", ...]
-search_tools("send email")   → [{name: "outlook__search-emails", serviceId: "outlook"}, ...]
-get_schemas(["todoist__get-task"])  → [full input schema]
+search_tools("send email")   → [{name: "outlook__search-emails", serviceId: "outlook", inputSchema: {...}}, ...]
+get_schemas(["todoist__get-task"])  → [full input schema]   (for tools found by browsing)
 call_tool("todoist__get-task", {id: "123"}) → result
 ```
 
@@ -137,6 +137,8 @@ The `search_tools` tool lets agents find tools by query instead of browsing ever
 
 Keyword matching against tool names and descriptions. Fast, no dependencies. Best for queries like `"send email"` or `"ebay orders"` — concise terms that appear in the tool metadata.
 
+Tool names and descriptions are split into words (on punctuation and camelCase), and a query word matches any word it is a prefix of — `email` finds `emails`, but `an` does not match `manage`. Common filler words (`a`, `an`, `the`, `to`, `my`, …) are dropped from the query unless it contains nothing else.
+
 ```yaml
 search:
   type: lexical
@@ -201,9 +203,9 @@ The nexus exposes these tools to connected AI agents:
 | ----------------- | ---------------------------------------------------------------------- |
 | `browse_services` | List all available upstream services with descriptions and tool counts |
 | `browse_tools`    | List all tools for a specific service (namespaced names)               |
-| `search_tools`    | Search for tools by keyword (lexical) or natural language (semantic)   |
+| `search_tools`    | Search for tools by keyword (lexical) or natural language (semantic); every hit carries its full schema |
 | `get_schemas`     | Get input schemas and inferred response shapes for one or more tools   |
-| `call_tool`       | Call a tool on an upstream service, optionally trimming the response or writing it to a file |
+| `call_tool`       | Call a tool on an upstream service, optionally trimming the response or writing it to a file. Arguments are checked against the tool's input schema first; a mismatch is refused with the problems and the schema |
 | `index`           | Diagnostic — shows index summary, source availability, and error info  |
 
 Additionally, any tools listed under `preloadedTools` on a source will appear directly in the `tools/list` response alongside the built-in nexus tools — no browsing needed.
@@ -337,6 +339,7 @@ src/
   indexer.ts            Startup index — fetches tools/list from all sources
   artefacts.ts          Run directories, artefact writing, retention
   recovery.ts           Background recovery probes for failed sources
+  validation.ts         call_tool argument checking against the upstream input schema
   nexus-server.ts       MCP server — tool definitions and request handling
   sources/
     http-source.ts      HTTP transport client (Streamable HTTP)
@@ -344,7 +347,7 @@ src/
   search/
     index.ts            SearchEngine — strategy dispatch + fallback
     types.ts            Search config, result, and provider interfaces
-    lexical-search.ts   Keyword matching (token-based scoring)
+    lexical-search.ts   Keyword matching (word-prefix scoring, stopwords dropped)
     semantic-search.ts  Embedding similarity search
     providers/
       builtin.ts        Transformers.js (all-MiniLM-L6-v2, local)

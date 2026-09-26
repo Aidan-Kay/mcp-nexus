@@ -18,7 +18,8 @@ import { logger } from "./logger.js";
 import { namespaceTool, parseNamespacedName } from "./namespace.js";
 import { inferShape, minifyContent, project, relevantShape, replaceJsonBlock, resolveJsonBlock, textOf, type ContentBlock } from "./projection.js";
 import type { SearchEngine } from "./search/index.js";
-import type { NexusConfig, NexusIndex, UpstreamCallResult } from "./types.js";
+import type { IndexedTool, NexusConfig, NexusIndex, UpstreamCallResult } from "./types.js";
+import { validateArguments } from "./validation.js";
 
 // Transport-specific callers
 import { callTool as httpCallTool, fetchTools as httpFetchTools } from "./sources/http-source.js";
@@ -179,9 +180,24 @@ export class NexusServer {
       roster.length > 0 ? roster.join("\n") : "- (none indexed)",
       "",
       "That roster is a snapshot taken when this session opened — call `index` for current availability. " +
-        "Use `search_tools` to find a tool by what you want to do, `browse_tools` to list one service's tools, " +
-        "`get_schemas` before calling an unfamiliar tool, and `call_tool` to invoke it.",
+        "Use `search_tools` to find a tool by what you want to do — each hit carries its full schema, so you can " +
+        "`call_tool` straight from the results. `browse_tools` lists one service's tools by name; call `get_schemas` " +
+        "for any you pick from there before invoking them.",
     ].join("\n");
+  }
+
+  /**
+   * What an agent needs to call a tool: shared by get_schemas and search_tools so the
+   * two cannot disagree about a tool's schema.
+   */
+  private describeTool(name: string, indexed: IndexedTool) {
+    return {
+      description: indexed.tool.description,
+      inputSchema: indexed.tool.inputSchema,
+      // Declared by the upstream service — absent on most, hence responseShape below
+      outputSchema: indexed.tool.outputSchema,
+      responseShape: this.responseShapes.get(name),
+    };
   }
 
   /** Register the 6 nexus management tools with the given SDK McpServer instance */
@@ -242,8 +258,8 @@ export class NexusServer {
     // queries (semantic). The strategy is fixed at startup via config.
     const isSemantic = this.config.search.type === "semantic";
     const searchDescription = isSemantic
-      ? "Search for tools across all services (or within a single service) by semantic similarity. Returns matching tool names and their service IDs, ranked by relevance. Use this to find the right tool without browsing every service. Use natural-language queries describing what you want to do (e.g. 'I want to send an email', 'find tools for managing my inbox')."
-      : "Search for tools across all services (or within a single service) by keyword matching. Returns matching tool names and their service IDs, ranked by relevance. Use this to find the right tool without browsing every service. Use concise keywords that appear in tool names or descriptions (e.g. 'send email', 'ebay orders', 'create task').";
+      ? "Search for tools across all services (or within a single service) by semantic similarity. Returns matching tools ranked by relevance, each with its description, full inputSchema and — once the tool has been called — its responseShape, so no get_schemas call is needed before call_tool. Use natural-language queries describing what you want to do (e.g. 'I want to send an email', 'find tools for managing my inbox')."
+      : "Search for tools across all services (or within a single service) by keyword matching. Returns matching tools ranked by relevance, each with its description, full inputSchema and — once the tool has been called — its responseShape, so no get_schemas call is needed before call_tool. Use concise keywords that appear in tool names or descriptions (e.g. 'send email', 'ebay orders', 'create task').";
     const queryDescription = isSemantic
       ? "Search query — natural language description of what you want to do (e.g. 'I want to send an email', 'find tools for managing my inbox')"
       : "Search query — keywords that appear in tool names or descriptions (e.g. 'send email', 'ebay orders', 'create task')";
@@ -262,16 +278,17 @@ export class NexusServer {
           return { content: [{ type: "text", text: "Missing required parameter: query" }], isError: true };
         }
 
-        const result = await this.searchEngine.search(query, serviceId);
+        const { results, ...rest } = await this.searchEngine.search(query, serviceId);
+        // Every hit carries what get_schemas would have said about it: the round trip
+        // between finding a tool and calling it was the common case, not the exception.
+        // A hit whose tool left the index mid-search (a re-index) is dropped rather
+        // than returned without the schema it promises.
+        const hits = results.flatMap(({ name, serviceId }) => {
+          const indexed = this.index.tools.get(name);
+          return indexed ? [{ name, serviceId, ...this.describeTool(name, indexed) }] : [];
+        });
 
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result),
-            },
-          ],
-        };
+        return { content: [{ type: "text", text: JSON.stringify({ ...rest, results: hits }) }] };
       },
     );
 
@@ -309,15 +326,7 @@ export class NexusServer {
             missing.push(name);
             continue;
           }
-          schemas.push({
-            toolName: name,
-            sourceId: indexed.sourceId,
-            description: indexed.tool.description,
-            inputSchema: indexed.tool.inputSchema,
-            // Declared by the upstream service — absent on most, hence responseShape below
-            outputSchema: indexed.tool.outputSchema,
-            responseShape: this.responseShapes.get(name),
-          });
+          schemas.push({ toolName: name, sourceId: indexed.sourceId, ...this.describeTool(name, indexed) });
         }
 
         return { content: [{ type: "text", text: JSON.stringify({ schemas, missing: missing.length > 0 ? missing : undefined }) }] };
@@ -640,6 +649,25 @@ export class NexusServer {
               error: `these are arguments of call_tool itself, not parameters of ${toolName}: ${misplaced.join(", ")}`,
               misplaced,
               hint: `move them out of 'parameters' and pass them alongside it — { "toolName": "${toolName}", "parameters": {...}, "${misplaced[0]}": ${example} }`,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // Refused here rather than upstream so the refusal can carry the schema — the
+    // upstream's own error rarely does, and the fix is always to read it.
+    const invalid = validateArguments(toolName, indexed.tool.inputSchema, parameters);
+    if (invalid.length > 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: `arguments do not match the input schema of ${toolName}`,
+              problems: invalid,
+              inputSchema: indexed.tool.inputSchema,
             }),
           },
         ],
