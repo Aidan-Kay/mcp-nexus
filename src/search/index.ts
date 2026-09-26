@@ -2,14 +2,18 @@
 
 import { logger } from "../logger.js";
 import type { NexusIndex } from "../types.js";
+import { hybridSearch } from "./hybrid-search.js";
 import { lexicalSearch } from "./lexical-search.js";
 import { EmbeddingIndex } from "./semantic-search.js";
-import type { EmbeddingProvider, ScoredResult, SearchConfig, SearchResult } from "./types.js";
+import type { EmbeddingProvider, ScoredResult, SearchConfig, SearchResult, SearchType } from "./types.js";
 
 /**
  * Unified search engine.
  *
  * - When type === "lexical": uses substring scoring only.
+ * - When type === "hybrid": fuses semantic and lexical rankings. If the embedding
+ *   provider fails (network error, service down), falls back to lexical search and
+ *   sets fellBackToLexical: true in the result.
  * - When type === "semantic": uses cosine similarity. If the embedding
  *   provider fails (network error, service down), falls back to lexical
  *   search and sets fellBackToLexical: true in the result.
@@ -51,6 +55,28 @@ export class SearchEngine {
       return this.runLexical(query, serviceId, max, "lexical", false);
     }
 
+    if (this.config.type === "hybrid") {
+      if (!this.provider || !this.embeddingIndex) {
+        logger.warn("Hybrid search configured but provider/index not available — falling back to lexical");
+        return this.runLexical(query, serviceId, max, "hybrid", true);
+      }
+      try {
+        const queryEmbedding = await this.provider.embed(query);
+        return hybridSearch({
+          query,
+          tools: this.index.tools,
+          embeddingIndex: this.embeddingIndex,
+          queryEmbedding,
+          minSimilarity: this.config.semantic?.minSimilarity ?? 0,
+          maxResults: max,
+          serviceId,
+        });
+      } catch (err) {
+        logger.warn(`Hybrid search failed — falling back to lexical: ${err instanceof Error ? err.message : String(err)}`);
+        return this.runLexical(query, serviceId, max, "hybrid", true);
+      }
+    }
+
     // Semantic search
     if (!this.provider || !this.embeddingIndex) {
       logger.warn("Semantic search configured but provider/index not available — falling back to lexical");
@@ -72,7 +98,7 @@ export class SearchEngine {
     query: string,
     serviceId: string | undefined,
     max: number,
-    strategy: "lexical" | "semantic",
+    strategy: SearchType,
     fellBack: boolean,
   ): SearchResult {
     const scored = lexicalSearch(query, this.index.tools, serviceId);
@@ -83,7 +109,7 @@ export class SearchEngine {
     query: string,
     scored: ScoredResult[],
     max: number,
-    strategy: "lexical" | "semantic",
+    strategy: SearchType,
     fellBack: boolean,
     matchFloor = 0,
   ): SearchResult {
@@ -113,7 +139,7 @@ export class SearchEngine {
  * Returns undefined if semantic search is not configured.
  */
 export async function createEmbeddingProvider(config: SearchConfig): Promise<EmbeddingProvider | undefined> {
-  if (config.type !== "semantic" || !config.semantic) return undefined;
+  if ((config.type !== "semantic" && config.type !== "hybrid") || !config.semantic) return undefined;
 
   const { provider: providerType, model, baseUrl, apiKeyEnv, modelCachePath } = config.semantic;
 

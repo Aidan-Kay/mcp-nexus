@@ -73,11 +73,12 @@ async function main(): Promise<void> {
   logger.info("Indexing upstream MCP sources...");
   const index = await buildIndex(config.sources);
 
-  // 2b. Initialize search engine (lexical or semantic)
+  // 2b. Initialize search engine (lexical, semantic, or hybrid)
   let searchEngine: SearchEngine;
   let embeddingProvider = undefined;
-  if (config.search.type === "semantic" && config.search.semantic) {
-    logger.info(`Initializing semantic search (provider: ${config.search.semantic.provider})...`);
+  const needsEmbeddings = config.search.type === "semantic" || config.search.type === "hybrid";
+  if (needsEmbeddings && config.search.semantic) {
+    logger.info(`Initializing ${config.search.type} search (provider: ${config.search.semantic.provider})...`);
     try {
       embeddingProvider = await createEmbeddingProvider(config.search);
       const embeddingIndex = getEmbeddingIndex(embeddingProvider!);
@@ -86,9 +87,9 @@ async function main(): Promise<void> {
       }
       searchEngine = new SearchEngine(config.search, index, embeddingProvider);
       searchEngine.setEmbeddingIndex(embeddingIndex!);
-      logger.info("Semantic search initialized");
+      logger.info(`${config.search.type} search initialized`);
     } catch (err) {
-      logger.error(`Failed to initialize semantic search: ${err instanceof Error ? err.message : String(err)}`);
+      logger.error(`Failed to initialize ${config.search.type} search: ${err instanceof Error ? err.message : String(err)}`);
       logger.warn("Falling back to lexical search");
       searchEngine = new SearchEngine(config.search, index);
     }

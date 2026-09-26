@@ -24,9 +24,18 @@ jobs:
 
       - run: npm ci --no-audit --no-fund
 
-      # No test suite exists yet, so the compiler is the whole check. It is
-      # still the one that matters most: the image's own build step is tsc.
+      # The image's own build step is tsc, so this is the check that matters most.
       - run: npx tsc --noEmit
+      - run: npx tsc --noEmit -p eval
+
+      # The relevance eval: search ranking against the committed corpus, failing on
+      # any regression from eval/baseline.json. Semantic and hybrid need the local
+      # embedding model, which is downloaded once and cached between runs.
+      - uses: actions/cache@v6
+        with:
+          path: eval/.model-cache
+          key: embedding-model-all-MiniLM-L6-v2
+      - run: npm run eval
 
   image:
     runs-on: ubuntu-latest

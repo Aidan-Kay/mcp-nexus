@@ -13,14 +13,18 @@ Node 22 (the image's base and CI's version), TypeScript, ESM.
 ## Commands
 
 ```
-npx tsc --noEmit      # the check - CI runs this and nothing else
+npx tsc --noEmit      # typecheck
+npx tsc --noEmit -p eval   # typecheck the eval too
+npm run eval          # search relevance eval; fails on regression from eval/baseline.json
 npm run build         # tsc into dist/
 npm run dev           # tsx watch, against ./mcp-nexus.yaml
 docker build -t mcp-nexus .
 ```
 
-There is no test suite and no linter. Do not offer a command that does not
-exist as an acceptance check; the typecheck is it.
+There is no unit test suite and no linter. The acceptance checks are the two
+typechecks and `npm run eval`, which is what CI runs. Any change to search
+ranking must pass the eval; improve the baseline only deliberately, with
+`npm run eval -- --update`, never to make a regression go away.
 
 ## Layout
 
@@ -28,7 +32,8 @@ exist as an acceptance check; the typecheck is it.
 src/index.ts          entry point
 src/nexus-server.ts   the MCP surface: browse, search, get_schemas, call_tool
 src/sources/          one transport per file - http and stdio upstreams
-src/search/           lexical and semantic tool search, embedding providers
+src/search/           lexical, semantic and hybrid tool search, embedding providers
+eval/                 offline relevance eval: corpus snapshot, queries, baseline
 src/artefacts.ts      large tool results written to files instead of returned
 src/recovery.ts       re-probes failed sources on a timer
 ```

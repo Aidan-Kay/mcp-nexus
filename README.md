@@ -109,7 +109,7 @@ sources:
 | `auth.allowedOrigins`                    | Optional list of origins allowed via CORS when auth is enabled. If omitted, the request `Origin` is reflected back  |
 | `connectors.httpReuseIdleTimeoutSeconds` | Idle timeout before a cached upstream HTTP session is reaped (default: 300)                                         |
 | `connectors.recoveryIntervalSeconds`     | Interval (seconds) for background recovery probes of failed sources. 0 = disabled (default: 30)                     |
-| `search.type`                            | Search strategy: `"lexical"` (keyword matching, default) or `"semantic"` (embedding-based similarity)               |
+| `search.type`                            | Search strategy: `"lexical"` (keyword matching, default), `"semantic"` (embedding-based similarity) or `"hybrid"` (both, fused) |
 | `search.maxResults`                      | Max results returned by `search_tools` (default: 20)                                                                |
 | `search.semantic.provider`               | Embedding provider: `"built-in"` (local model), `"ollama"`, or `"openai-compatible"` (required if type is semantic) |
 | `search.semantic.model`                  | Model name (provider-specific; defaults vary by provider)                                                           |
@@ -136,7 +136,7 @@ The `search_tools` tool lets agents find tools by query instead of browsing ever
 
 `totalMatches` counts real matches rather than tools scanned. Under lexical search that is every tool matching a query word. Under semantic search every tool has *some* similarity, so only those at or above `search.semantic.minSimilarity` are counted or returned: a search may come back with fewer than `maxResults` hits, and a query nothing resembles comes back empty rather than padded with weak guesses.
 
-Two strategies are available, configured at startup via `search.type`:
+Three strategies are available, configured at startup via `search.type`:
 
 ### Lexical (default)
 
@@ -173,7 +173,25 @@ search:
 | `ollama`            | Local Ollama instance (nomic-embed-text, 768d)            | Requires `baseUrl` (e.g. `http://localhost:11434`)      |
 | `openai-compatible` | Any OpenAI-compatible API (text-embedding-3-small, 1536d) | Requires `baseUrl`, `apiKeyEnv`, and `model`            |
 
-If the semantic provider fails at query time (e.g. Ollama is down), the search engine **falls back to lexical** automatically. The response includes `strategy` and `fellBackToLexical` fields so the agent can tell what happened.
+### Hybrid
+
+Semantic and lexical ranking fused, for a corpus where neither is enough alone: semantic understands intent but can miss a tool whose description never uses the query's words, and lexical finds exact names but matches filler. Takes the same `semantic` block as semantic search.
+
+```yaml
+search:
+  type: hybrid
+  maxResults: 5
+  semantic:
+    provider: built-in
+    model: Xenova/all-MiniLM-L6-v2
+```
+
+- **Ranking** is reciprocal-rank fusion: each tool scores `1/(60 + semantic rank) + 1/(60 + lexical rank)`. Both arms rank every tool in scope, so a strong name match is never shut out by a weak semantic one.
+- **A match** — what is returned and counted in `totalMatches` — is a tool whose similarity reaches `minSimilarity`, *or* whose name contains at least two of the query's meaningful words (one, for a one-word query). Words of the service's own name don't count towards that, so "todoist" in a query does not make every Todoist tool a match. A description match alone helps a tool's rank but does not make it a match.
+- **An exact tool name** — namespaced or bare, in any of `snake_case`, `kebab-case` or `camelCase` — is pinned first with `pinned: true`.
+- **Every hit says how it matched**: `matched` is `semantic`, `lexical` or `both`. No fused score is shown: it measures how far the two rankings agreed, which reads as a confidence and is not one.
+
+If the semantic provider fails at query time (e.g. Ollama is down), semantic and hybrid search **fall back to lexical** automatically. The response includes `strategy` and `fellBackToLexical` fields so the agent can tell what happened.
 
 ## Docker
 
@@ -345,6 +363,7 @@ src/
   artefacts.ts          Run directories, artefact writing, retention
   recovery.ts           Background recovery probes for failed sources
   validation.ts         call_tool argument checking against the upstream input schema
+  compact-schema.ts     Compact input schemas for search results
   nexus-server.ts       MCP server — tool definitions and request handling
   sources/
     http-source.ts      HTTP transport client (Streamable HTTP)
@@ -354,6 +373,7 @@ src/
     types.ts            Search config, result, and provider interfaces
     lexical-search.ts   Keyword matching (word-prefix scoring, stopwords dropped)
     semantic-search.ts  Embedding similarity search
+    hybrid-search.ts    Reciprocal-rank fusion of the two, exact-name pinning
     providers/
       builtin.ts        Transformers.js (all-MiniLM-L6-v2, local)
       ollama.ts         Ollama embedding API (nomic-embed-text)
@@ -369,3 +389,11 @@ src/
 | `npm run build`        | Compile TypeScript to `dist/`       |
 | `npm run docker:build` | Build Docker image                  |
 | `npm run docker:run`   | Run Docker container                |
+| `npm run eval`         | Search relevance eval against `eval/baseline.json` |
+| `npm run eval:snapshot`| Refresh `eval/tools.json` from a running nexus (`NEXUS_URL`, `NEXUS_TOKEN`) |
+
+## Relevance eval
+
+`eval/` measures search ranking offline, so a change to it is judged by numbers rather than a few hand-run queries. `eval/tools.json` is a snapshot of the live corpus (names, descriptions and parameter names only); `eval/queries.json` lists queries with every acceptable tool, including queries nothing should match. `npm run eval` scores hit@5, MRR and the share of nonsense queries returning nothing for each strategy, and fails on any regression from `eval/baseline.json`. CI runs it on every push.
+
+A deliberate improvement is recorded with `npm run eval -- --update`, in the same commit as the change. Refreshing the corpus with `npm run eval:snapshot` invalidates the baseline, so re-baseline in the same commit.

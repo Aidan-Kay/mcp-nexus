@@ -4,15 +4,15 @@ import type { IndexedTool } from "../types.js";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-export type SearchType = "lexical" | "semantic";
+export type SearchType = "lexical" | "semantic" | "hybrid";
 export type EmbeddingProviderType = "built-in" | "ollama" | "openai-compatible";
 
 export interface SearchConfig {
-  /** Search algorithm: lexical (default) or semantic */
+  /** Search algorithm: lexical (default), semantic, or hybrid */
   type: SearchType;
   /** Max results returned by search_tools */
   maxResults: number;
-  /** Semantic search settings (only used when type === "semantic") */
+  /** Semantic search settings (used when type === "semantic" or "hybrid") */
   semantic?: SemanticSearchConfig;
 }
 
@@ -53,9 +53,21 @@ export interface ScoredResult {
   score: number;
 }
 
+/** Which match condition(s) a hybrid hit satisfied. */
+export type MatchKind = "semantic" | "lexical" | "both";
+
+export interface SearchResultItem {
+  name: string;
+  serviceId: string;
+  /** Hybrid only: whether the hit matched by meaning, by name, or both. */
+  matched?: MatchKind;
+  /** Hybrid only: an exact tool-name query pins that tool first. */
+  pinned?: true;
+}
+
 export interface SearchResult {
   query: string;
-  results: Array<{ name: string; serviceId: string }>;
+  results: SearchResultItem[];
   /**
    * Lexical: tools matching at least one query word. Semantic: tools at or above
    * minSimilarity — every tool has *some* similarity, so counting all of them would

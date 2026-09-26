@@ -96,7 +96,7 @@ const SemanticSearchConfigSchema = z
   });
 
 const SearchConfigSchema = z.object({
-  type: z.enum(["lexical", "semantic"]).default("lexical"),
+  type: z.enum(["lexical", "semantic", "hybrid"]).default("lexical"),
   maxResults: z.number().int().min(1).max(100).default(20),
   semantic: SemanticSearchConfigSchema.optional(),
 });

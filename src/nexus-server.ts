@@ -252,15 +252,29 @@ export class NexusServer {
 
     // ─── search_tools ─────────────────────────────────────────────────────
     // Description is dynamic based on the active search strategy so the LLM
-    // knows whether to use keyword-style queries (lexical) or natural-language
-    // queries (semantic). The strategy is fixed at startup via config.
+    // knows whether to use keyword-style queries (lexical), natural-language
+    // queries (semantic), or either (hybrid). The strategy is fixed at startup
+    // via config.
     const isSemantic = this.config.search.type === "semantic";
-    const searchDescription = isSemantic
-      ? "Search for tools across all services (or within a single service) by semantic similarity. Returns matching tools ranked by relevance, each with its description, inputSchema and — once the tool has been called — its responseShape. Structured arguments (nested objects, arrays of objects) are cut to their type and named in inputSchemaTrimmed: call get_schemas for those tools; any other hit can go straight to call_tool. Only tools similar enough to count as a match are returned, so an empty result means nothing matched: rephrase the query rather than assume the tool does not exist. Use natural-language queries describing what you want to do (e.g. 'I want to send an email', 'find tools for managing my inbox')."
-      : "Search for tools across all services (or within a single service) by keyword matching. Returns matching tools ranked by relevance, each with its description, inputSchema and — once the tool has been called — its responseShape. Structured arguments (nested objects, arrays of objects) are cut to their type and named in inputSchemaTrimmed: call get_schemas for those tools; any other hit can go straight to call_tool. Use concise keywords that appear in tool names or descriptions (e.g. 'send email', 'ebay orders', 'create task').";
-    const queryDescription = isSemantic
-      ? "Search query — natural language description of what you want to do (e.g. 'I want to send an email', 'find tools for managing my inbox')"
-      : "Search query — keywords that appear in tool names or descriptions (e.g. 'send email', 'ebay orders', 'create task')";
+    const isHybrid = this.config.search.type === "hybrid";
+    const commonDescription =
+      "Search for tools across all services (or within a single service). Returns matching tools ranked by relevance, each with its description, inputSchema and — once the tool has been called — its responseShape. Structured arguments (nested objects, arrays of objects) are cut to their type and named in inputSchemaTrimmed: call get_schemas for those tools; any other hit can go straight to call_tool.";
+    const searchDescription = isHybrid
+      ? "Search for tools across all services (or within a single service) by meaning and by name. " +
+        commonDescription +
+        " Each hit carries 'matched', saying whether it matched by meaning, by name, or both, and an exact tool name is pinned first. Only tools that match closely enough are returned, so an empty result means nothing matched: rephrase the query rather than assume the tool does not exist. Accepts both natural-language queries describing what you want to do (e.g. 'I want to send an email') and exact tool or parameter names (e.g. 'todoist_task_update', 'bidPercentage')."
+      : isSemantic
+        ? "Search for tools across all services (or within a single service) by semantic similarity. " +
+          commonDescription +
+          " Only tools similar enough to count as a match are returned, so an empty result means nothing matched: rephrase the query rather than assume the tool does not exist. Use natural-language queries describing what you want to do (e.g. 'I want to send an email', 'find tools for managing my inbox')."
+        : "Search for tools across all services (or within a single service) by keyword matching. " +
+          commonDescription +
+          " Use concise keywords that appear in tool names or descriptions (e.g. 'send email', 'ebay orders', 'create task').";
+    const queryDescription = isHybrid
+      ? "Search query — natural language describing what you want to do, or an exact tool or parameter name (e.g. 'send an email', 'todoist_task_update', 'bidPercentage')"
+      : isSemantic
+        ? "Search query — natural language description of what you want to do (e.g. 'I want to send an email', 'find tools for managing my inbox')"
+        : "Search query — keywords that appear in tool names or descriptions (e.g. 'send email', 'ebay orders', 'create task')";
 
     mcpServer.registerTool(
       "search_tools",
@@ -282,7 +296,7 @@ export class NexusServer {
         // a few Graph-sized entities cannot swamp a search; outputSchema is left to
         // get_schemas for the same reason. A hit whose tool left the index mid-search
         // (a re-index) is dropped rather than returned without the schema it promises.
-        const hits = results.flatMap(({ name, serviceId }) => {
+        const hits = results.flatMap(({ name, serviceId, matched, pinned }) => {
           const indexed = this.index.tools.get(name);
           if (!indexed) return [];
           const { schema, trimmed } = compactSchema(indexed.tool.inputSchema);
@@ -290,6 +304,8 @@ export class NexusServer {
             {
               name,
               serviceId,
+              matched,
+              pinned,
               description: indexed.tool.description,
               inputSchema: schema,
               inputSchemaTrimmed: trimmed,
