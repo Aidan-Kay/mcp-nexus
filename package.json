@@ -8,7 +8,9 @@
     "start": "tsx src/index.ts",
     "build": "tsc",
     "docker:build": "docker build -t mcp-nexus .",
-    "docker:run": "docker run -d --name mcp-nexus -p 8050:8050 -v ./mcp-nexus.yaml:/app/mcp-nexus.yaml mcp-nexus"
+    "docker:run": "docker run -d --name mcp-nexus -p 8050:8050 -v ./mcp-nexus.yaml:/app/mcp-nexus.yaml mcp-nexus",
+    "eval": "tsx eval/run.ts",
+    "eval:snapshot": "tsx eval/snapshot.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

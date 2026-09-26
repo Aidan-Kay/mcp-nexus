@@ -7,8 +7,8 @@
  * multi-thousand-token response when the caller was often only looking for a name.
  *
  * So search keeps each top-level argument whole when it is simple (scalars, enums,
- * arrays of scalars, unions of those) and cuts a structured one down to its type and
- * description, naming it in `trimmed`. Most tools have no structured arguments, so
+ * arrays of scalars, unions of those) or a flat object of simple properties, and cuts
+ * anything nested deeper down to its type and description, naming it in `trimmed`. Most tools have no structured arguments, so
  * their compact schema *is* the full one and they can be called directly; for the rest
  * the trimmed names say exactly when get_schemas is needed.
  */
@@ -31,6 +31,17 @@ function isSimple(schema: unknown): boolean {
   return true;
 }
 
+/**
+ * An object one level deep whose every property is simple — `{ bidPercentage: string }`.
+ * It costs about what a scalar does to show, and trimming it bought nothing but a
+ * get_schemas round trip. Anything with an object inside it is still trimmed.
+ */
+function isFlatObject(schema: unknown): boolean {
+  if (!isObject(schema) || "$ref" in schema || !isObject(schema.properties)) return false;
+  if ("additionalProperties" in schema && !isSimple(schema.additionalProperties)) return false;
+  return Object.values(schema.properties).every(isSimple);
+}
+
 export interface CompactSchema {
   schema: unknown;
   /** Top-level arguments cut to type and description; absent when nothing was cut. */
@@ -44,7 +55,7 @@ export function compactSchema(inputSchema: unknown): CompactSchema {
   const trimmed: string[] = [];
 
   for (const [name, prop] of Object.entries(inputSchema.properties)) {
-    if (isSimple(prop)) {
+    if (isSimple(prop) || isFlatObject(prop)) {
       properties[name] = prop;
       continue;
     }

@@ -4,3 +4,4 @@ md
 *.yaml
 !mcp-nexus.example.yaml
 tmp
+eval/.model-cache/
