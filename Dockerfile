@@ -34,12 +34,9 @@ RUN apt-get update && \
 # Create non-root user
 RUN groupadd -r nexus && useradd -r -g nexus nexus
 
-# Filesystem MCP server — launched by nexus as a stdio source (the `files` source in
-# mcp-nexus.yaml), sandboxed to /data/lyra. Installed into the image rather than fetched
-# at runtime with `npx -y`: the container has no writable $HOME, so npx has nowhere to
-# put its cache and the source would fail to start. Pinned deliberately — this package
-# can write files on Lyra's behalf.
-RUN npm install -g @modelcontextprotocol/server-filesystem@2026.7.10
+# No stdio MCP server is installed here. A stdio source needs its command inside this
+# image, installed at build time and pinned: the container has no writable $HOME, so
+# `npx -y` has nowhere to put its cache and the source would fail to start.
 
 COPY --from=builder /app/package.json /app/package-lock.json ./
 COPY --from=builder /app/node_modules/ ./node_modules/

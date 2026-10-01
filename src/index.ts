@@ -15,6 +15,7 @@ import { NexusServer } from "./nexus-server.js";
 import { startRecovery, stopRecovery } from "./recovery.js";
 import { createEmbeddingProvider, generateToolEmbeddings, getEmbeddingIndex, SearchEngine } from "./search/index.js";
 import { configureHttpConnector, shutdownHttp } from "./sources/http-source.js";
+import { configureResponseLimit } from "./sources/limits.js";
 import { killAll } from "./sources/stdio-source.js";
 
 // ─── CLI Args ────────────────────────────────────────────────────────────────
@@ -64,6 +65,7 @@ async function main(): Promise<void> {
 
   // Configure HTTP connection reuse + idle reaping
   configureHttpConnector(config.connectors.httpReuseIdleTimeoutSeconds);
+  configureResponseLimit(config.connectors.maxResponseBytes);
 
   // Prepare the artefacts root and prune what has aged out (no-op when unconfigured).
   // Done before indexing so a bad mount fails fast rather than at the first write.
@@ -89,9 +91,11 @@ async function main(): Promise<void> {
       searchEngine.setEmbeddingIndex(embeddingIndex!);
       logger.info(`${config.search.type} search initialized`);
     } catch (err) {
-      logger.error(`Failed to initialize ${config.search.type} search: ${err instanceof Error ? err.message : String(err)}`);
+      const reason = err instanceof Error ? err.message : String(err);
+      logger.error(`Failed to initialize ${config.search.type} search: ${reason}`);
       logger.warn("Falling back to lexical search");
       searchEngine = new SearchEngine(config.search, index);
+      searchEngine.markUnavailable(reason);
     }
   } else {
     searchEngine = new SearchEngine(config.search, index);

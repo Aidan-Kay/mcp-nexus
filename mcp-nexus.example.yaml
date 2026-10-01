@@ -1,14 +1,26 @@
 port: 8050
 
+# Every key below is checked: one this file does not list is a startup error, not ignored.
+
 auth:
-  enabled: false # Set to true and provide a token in production
-  token: ""
+  enabled: false # Set to true in production
+  # Tokens never go in this file. MCP_NEXUS_AUTH_TOKEN is the shared token (client
+  # `default`); MCP_NEXUS_TOKEN_<NAME> gives a client its own (MCP_NEXUS_TOKEN_LYRA is
+  # client `lyra`), so the call log can say who called and a policy can apply to it.
   allowedOrigins: # Optional — restrict CORS to these origins when auth is on
     - https://openwebui.local
+  # clients: # Optional — what each client may call. A client without an entry may call anything.
+  #   lyra:
+  #     deny: ["ebay__ebay_issue_refund"] # Globs over namespaced tool names; hidden and refused
+  #     confirm: ["ebay__ebay_end_*"] # These need a confirmed second call
+  #     confirmDestructive: true # ...as does every tool its service marks destructiveHint: true
+  #   n8n:
+  #     allow: ["todoist__*"] # When set, only these are visible or callable
 
 connectors:
   httpReuseIdleTimeoutSeconds: 300 # Reap idle upstream HTTP sessions after N seconds
   recoveryIntervalSeconds: 30 # Probe failed sources every N seconds (0 = disabled)
+  maxResponseBytes: 33554432 # Abandon an upstream response larger than this (32 MB)
 
 search:
   type: lexical # "lexical" (keyword matching), "semantic" (embedding-based) or "hybrid" (both fused)
@@ -63,15 +75,4 @@ sources:
     description: Marketplace listings and orders
     transport: http
     url: http://ebay-mcp:8086/mcp
-    # Default response projections for tools that always return more than callers
-    # need. Keyed by the tool's own (non-prefixed) name; each value is a list of
-    # dotted paths, where [*] maps over an array and nesting is preserved.
-    # A `select` argument on the call overrides the default for that call.
-    # Run get_schemas on a tool to see its responseShape and write paths from it.
-    projections:
-      ebay_get_inventory_items:
-        - total
-        - inventoryItems[*].sku
-        - inventoryItems[*].product.title
-        - inventoryItems[*].condition
-        - inventoryItems[*].availability.shipToLocationAvailability.quantity
+    # allowUnknownArguments: true # Only for a service whose tools take keys their schemas do not declare

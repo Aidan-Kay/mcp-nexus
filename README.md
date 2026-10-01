@@ -59,14 +59,18 @@ Create a `mcp-nexus.yaml` file:
 port: 8050
 
 auth:
-  enabled: false # Set to true and provide a token in production
-  token: ""
+  enabled: false # Set to true in production; tokens come from the environment
   allowedOrigins: # Optional — restrict CORS to these origins when auth is on
     - https://openwebui.local
+  clients: # Optional — per-client policy (see Gateway)
+    lyra:
+      deny: ["ebay__ebay_issue_refund"]
+      confirmDestructive: true
 
 connectors:
   httpReuseIdleTimeoutSeconds: 300 # Reap idle upstream HTTP sessions after N seconds
   recoveryIntervalSeconds: 30 # Probe failed sources every N seconds (0 = disabled)
+  maxResponseBytes: 33554432 # Abandon an upstream response larger than this
 
 search:
   type: lexical # "lexical" (keyword matching) or "semantic" (embedding-based)
@@ -101,14 +105,22 @@ sources:
 
 ### Config Reference
 
+The schema is strict: a key it does not know — misspelt, or retired like `type` and
+`projections` — stops startup with the path of the key, rather than being dropped.
+
 | Field                                    | Description                                                                                                         |
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `port`                                   | HTTP port for the MCP endpoint (default: 8050)                                                                      |
 | `auth.enabled`                           | Require `Authorization: Bearer <token>` header                                                                      |
-| `auth.token`                             | Static bearer token (override via `MCP_NEXUS_AUTH_TOKEN` env var)                                                   |
+| `auth.token`                             | The shared token, authenticating as client `default`. Set it with `MCP_NEXUS_AUTH_TOKEN`, not here                   |
+| `auth.clients.<name>.allow`              | Globs over namespaced tool names (`todoist__*`). When set, only matching tools are visible or callable (see [Gateway](#gateway)) |
+| `auth.clients.<name>.deny`               | Globs; matching tools are hidden and refused. Wins over `allow`                                                     |
+| `auth.clients.<name>.confirm`            | Globs; matching tools need a confirmed second call                                                                  |
+| `auth.clients.<name>.confirmDestructive` | Also confirm every tool its service annotates `destructiveHint: true` (default: false)                              |
 | `auth.allowedOrigins`                    | Optional list of origins allowed via CORS when auth is enabled. If omitted, the request `Origin` is reflected back  |
 | `connectors.httpReuseIdleTimeoutSeconds` | Idle timeout before a cached upstream HTTP session is reaped (default: 300)                                         |
 | `connectors.recoveryIntervalSeconds`     | Interval (seconds) for background recovery probes of failed sources. 0 = disabled (default: 30)                     |
+| `connectors.maxResponseBytes`            | An upstream response larger than this is abandoned as it arrives, and the call returns an error (default: 33554432) |
 | `search.type`                            | Search strategy: `"lexical"` (keyword matching, default), `"semantic"` (embedding-based similarity) or `"hybrid"` (both, fused) |
 | `search.maxResults`                      | Max results returned by `search_tools` (default: 20)                                                                |
 | `search.semantic.provider`               | Embedding provider: `"built-in"` (local model), `"ollama"`, or `"openai-compatible"` (required if type is semantic) |
@@ -124,7 +136,7 @@ sources:
 | `sources[].command`                      | Executable to spawn (required for stdio transport)                                                                  |
 | `sources[].filter`                       | Optional glob patterns to curate which tools are indexed                                                            |
 | `sources[].preloadedTools`               | Optional array of non-prefixed tool names to surface directly in `tools/list` (e.g. `[\"search-emails\"]`)          |
-| `sources[].projections`                  | Optional default response projections, keyed by non-prefixed tool name (see [Response Shaping](#response-shaping))   |
+| `sources[].allowUnknownArguments`        | Pass arguments a tool's schema does not declare through to it. Off by default: they are refused (see [MCP Tools](#mcp-tools)) |
 | `artefacts.root`                         | Directory artefacts are written under. Omit the whole `artefacts` block to disable the feature (see [Artefacts](#artefacts)) |
 | `artefacts.retentionDays`                | Delete run directories older than this, at startup and daily (default: 14; 0 = never)                               |
 | `artefacts.runIdleMinutes`               | How long a label keeps resolving to the same run directory (default: 180)                                           |
@@ -136,6 +148,10 @@ The `search_tools` tool lets agents find tools by query instead of browsing ever
 
 `totalMatches` counts real matches rather than tools scanned. Under lexical search that is every tool matching a query word. Under semantic search every tool has *some* similarity, so only those at or above `search.semantic.minSimilarity` are counted or returned: a search may come back with fewer than `maxResults` hits, and a query nothing resembles comes back empty rather than padded with weak guesses.
 
+Under semantic and hybrid search each hit carries its `similarity` to the query (cosine, to two places), and the response carries `minSimilarity`. A broad query can match a hundred tools, so `totalMatches` alone cannot say whether the top hit is a close match or merely the best of a poor set; the similarity can.
+
+A client with a policy (see [Gateway](#gateway)) searches only the tools it may call: the rest are left out before ranking, so they neither appear nor count.
+
 Three strategies are available, configured at startup via `search.type`:
 
 ### Lexical (default)
@@ -143,6 +159,8 @@ Three strategies are available, configured at startup via `search.type`:
 Keyword matching against tool names and descriptions. Fast, no dependencies. Best for queries like `"send email"` or `"ebay orders"` — concise terms that appear in the tool metadata.
 
 Tool names and descriptions are split into words (on punctuation and camelCase), and a query word matches any word it is a prefix of — `email` finds `emails`, but `an` does not match `manage`. Common filler words (`a`, `an`, `the`, `to`, `my`, …) are dropped from the query unless it contains nothing else.
+
+A query word also matches through two kinds of variant, at half weight so the exact word still wins a tie: a plural matches its singular (`tasks` finds `task`), and the read verbs `list`, `get`, `fetch`, `retrieve`, `show` and `read` match each other. Services name their read tools with different verbs — ms365's `list-todo-tasks`, Todoist's `todoist_task_get` — and without this "list my tasks" was evidence for ms365's tools alone.
 
 ```yaml
 search:
@@ -189,9 +207,10 @@ search:
 - **Ranking** is reciprocal-rank fusion: each tool scores `1/(60 + semantic rank) + 1/(60 + lexical rank)`. Both arms rank every tool in scope, so a strong name match is never shut out by a weak semantic one.
 - **A match** — what is returned and counted in `totalMatches` — is a tool whose similarity reaches `minSimilarity`, *or* whose name contains at least two of the query's meaningful words (one, for a one-word query). Words of the service's own name don't count towards that, so "todoist" in a query does not make every Todoist tool a match. A description match alone helps a tool's rank but does not make it a match.
 - **An exact tool name** — namespaced or bare, in any of `snake_case`, `kebab-case` or `camelCase` — is pinned first with `pinned: true`.
-- **Every hit says how it matched**: `matched` is `semantic`, `lexical` or `both`. No fused score is shown: it measures how far the two rankings agreed, which reads as a confidence and is not one.
+- **A service's own "use X instead"** is followed. When a matching tool's description says to use another of the service's tools instead — ms365's `list-calendar-events` points to `get-calendar-view` for anything in a date range — that tool is placed directly after it, with `matched: suggested` (unless it matched on its own) and `suggestedBy` naming the tool that pointed to it. After, not before: such pointers are often conditional, so the caller is shown both and reads both descriptions.
+- **Every hit says how it matched**: `matched` is `semantic`, `lexical`, `both` or `suggested`, and `similarity` gives the semantic closeness. No fused score is shown: it measures how far the two rankings agreed, which reads as a confidence and is not one.
 
-If the semantic provider fails at query time (e.g. Ollama is down), semantic and hybrid search **fall back to lexical** automatically. The response includes `strategy` and `fellBackToLexical` fields so the agent can tell what happened.
+If the semantic provider fails at query time (e.g. Ollama is down), semantic and hybrid search **fall back to lexical** automatically. The response includes `strategy` and `fellBackToLexical` fields so the agent can tell what happened, and `/health` reports it for whoever runs the nexus: `search.semantic` is `unavailable` when the provider never started, `failing` when the latest query that needed it failed, with the error and `lastFallbackAt`. Either makes the overall status `degraded`.
 
 ## Docker
 
@@ -233,6 +252,16 @@ The nexus exposes these tools to connected AI agents:
 
 Additionally, any tools listed under `preloadedTools` on a source will appear directly in the `tools/list` response alongside the built-in nexus tools — no browsing needed.
 
+**Unknown arguments are refused.** Most upstream schemas leave `additionalProperties`
+unset, which JSON Schema reads as "anything goes", and the services then ignore keys
+they don't know. A misspelt filter — `due_date` for `due_before` — reached Todoist,
+was dropped there, and every task came back with nothing to say the filter never
+applied. `call_tool` now refuses any top-level argument the tool's schema does not
+declare, whatever `additionalProperties` says, and suggests the declared one it was
+probably meant to be. A schema that declares a map (`additionalProperties` as a
+schema, or `patternProperties`) or no properties at all is left alone, and a service
+whose tools genuinely take extra keys sets `sources[].allowUnknownArguments`.
+
 ## Response Shaping
 
 Upstream tools routinely return far more than an agent needs — every field of every
@@ -244,7 +273,7 @@ blocks, with each JSON block re-serialised compactly. This is lossless — nothi
 dropped, and blocks that aren't JSON (prose errors, images, embedded resources) pass
 through untouched. On live eBay responses this alone removes 38–48% of the bytes.
 
-**Projections.** To trim fields as well, give `call_tool` a `select` array of dotted
+**`select`.** To trim fields as well, give `call_tool` a `select` array of dotted
 paths. `[*]` maps over an array, and the original nesting is preserved:
 
 ```jsonc
@@ -259,10 +288,15 @@ A path matching nothing is returned as an **error**, not as absent data, so a ty
 can't be mistaken for a field the service doesn't return. The error carries the
 tool's response shape so the caller can correct itself.
 
-For tools that are *always* too wide, set a default under `sources[].projections`
-instead — keyed by the tool's own name, applied to every call, and overridden by an
-explicit `select`. A configured projection whose paths have drifted out of date warns
-and skips them rather than failing, since the caller didn't write it.
+A tool that returns plain text rather than JSON — Todoist's task tools all do — has
+nothing to select from. The text comes back as it was, with a note that `select` was
+ignored, rather than as an error: the call has already been made, and refusing it
+afterwards only made the caller make it again.
+
+Trimming happens only when the caller asks. There used to be a per-tool default trim
+in the config (`projections`); it was removed because the caller could not see it, so
+a field it had cut read as a field the service never returned. `select` and
+artefacts between them cover what it was for.
 
 **Discovering paths.** Most services declare no `outputSchema`, so `get_schemas`
 reports a `responseShape` instead: the leaf paths and types of what the tool last
@@ -272,7 +306,7 @@ first (most take a `limit` or `pageSize`) and the shape will be recorded.
 
 ## Artefacts
 
-Projections trim a response; artefacts remove it from the conversation altogether.
+`select` trims a response; artefacts remove it from the conversation altogether.
 When a result is only ever going to be aggregated by code — a full orders feed, a
 whole catalogue — passing an `artefacts` label writes it to a file and returns a
 receipt instead:
@@ -319,11 +353,11 @@ double-count.
 caller can check that pages sum to the expected total without opening anything. A
 page past the end of a feed reports `0` rather than going missing.
 
-**Projections still apply.** The context argument for trimming disappears, but the
-reason to keep buyer addresses out of a response is not that they are expensive.
-`select` still overrides a configured projection, and `shape` describes what is
-actually in the file — not the wider upstream response, which `get_schemas` still
-reports in full.
+**`select` still applies.** The context argument for trimming disappears, but the
+reason to keep buyer addresses out of a file is not that they are expensive. With
+both, the file holds only the selected paths, and `shape` describes what is actually
+in the file — not the wider upstream response, which `get_schemas` still reports in
+full.
 
 **Errors are never written to a file.** Transport failures, upstream tool errors and
 unmatched `select` paths all come back inline, as they do without a label. If the
@@ -335,6 +369,57 @@ Preloaded tools take no `artefacts` argument (or `select`), since they are dispa
 with the upstream schema verbatim. A tool wide enough to want either should be
 reached through `call_tool`.
 
+## Gateway
+
+Every caller is a named client, every call is logged under that name, and a client
+can be limited in what it may call. None of it is on until configured: a deployment
+with only the shared token behaves as before, with its calls logged as `default`.
+
+**Clients.** `MCP_NEXUS_AUTH_TOKEN` is the shared token and authenticates as
+`default`. Each `MCP_NEXUS_TOKEN_<NAME>` gives a client its own token —
+`MCP_NEXUS_TOKEN_LYRA` is client `lyra`. Tokens live in the environment only. Two
+clients with the same token are refused at startup, since neither could then be told
+apart. A session belongs to the client that opened it: a request carrying another
+client's token with that session's ID is refused with 403.
+
+**Policy**, per client under `auth.clients`, is globs over namespaced tool names, so
+`ebay__*` names a service and `ms365__send-mail` one tool. `allow`, when set, is the
+whole of what the client may use; `deny` removes from it and wins. It is enforced in
+`call_tool`, the only route to an upstream, and also shapes what the client is shown:
+denied tools are left out of `browse_services` counts, `browse_tools`, `search_tools`,
+`get_schemas`, preloaded tools and the service roster. (`sources[].filter` is
+different: it shapes the index for every client, and is not a control.)
+
+**Confirmation.** A tool matching the client's `confirm` patterns, or — with
+`confirmDestructive: true` — one its service annotates `destructiveHint: true`, is
+refused on the first call with a `confirm` token. Repeating the identical call with
+that token as `confirm` goes through. The token is bound to the client, the tool and
+the exact parameters, is spent on use, and expires after five minutes, so it cannot
+be replayed against another record or by another client. The refusal tells the agent
+to describe the call to the user and wait for their go-ahead; the token proves the
+call was repeated, not that a person agreed, which is why the call log records each
+refusal and each confirmed call.
+
+Only an explicit `destructiveHint: true` counts. MCP defaults the hint to true for any
+tool not marked read-only, so reading an absent annotation as destructive would gate
+every unannotated tool — all of Todoist and eBay, refunds included. Those are named in
+`confirm` instead. (At the time of writing ms365 marks 102 of its 178 tools
+destructive, including creating calendar events; Google Workspace 18; Plex 1.)
+
+The `confirm` argument is advertised only to clients whose policy can ask for it.
+
+**Call log.** Every `call_tool`, refused or not, writes one JSON line tagged
+`[nexus][calls]`:
+
+```
+2026-10-01T11:14:38.618Z [nexus][calls] [INFO] {"client":"lyra","tool":"todoist__todoist_task_get","outcome":"ok","ms":70,"args":["filter","limit"]}
+```
+
+`outcome` is `ok`, `tool_error`, `transport_error`, `invalid_arguments`, `not_found`,
+`denied`, `confirmation_required` or `artefact_error`. Arguments are logged by name
+only — their values carry message bodies, addresses and IDs. `docker logs mcp-nexus
+| grep '\[calls\]'` gives the log alone.
+
 ## Architecture
 
 ```
@@ -345,9 +430,11 @@ AI Agent ──Streamable HTTP──▶ mcp-nexus ──HTTP/stdio──▶ todo
 ```
 
 - **Transport**: MCP Streamable HTTP (2025-11-05)
-- **Auth**: Optional bearer token, with optional CORS origin allowlist
-- **Health**: `GET /health` endpoint for monitoring (Uptime Kuma, etc.)
+- **Auth**: Optional bearer tokens, one per client, with optional CORS origin allowlist (see [Gateway](#gateway))
+- **Health**: `GET /health` endpoint for monitoring (Uptime Kuma, etc.), including whether search is running as configured
 - **HTTP connection reuse**: keep-alive sessions per source, reaped after an idle timeout
+- **Response cap**: an upstream response over `connectors.maxResponseBytes` is abandoned as it arrives rather than buffered whole. A stdio source cannot be resynchronised mid-line, so its process is restarted on the next call
+- **Shutdown** stops taking requests, waits up to eight seconds for those in flight to finish their responses, and only then closes sessions and stops stdio children
 
 ## Project Structure
 
@@ -363,21 +450,30 @@ src/
   artefacts.ts          Run directories, artefact writing, retention
   recovery.ts           Background recovery probes for failed sources
   validation.ts         call_tool argument checking against the upstream input schema
+  gateway.ts            Client tokens, per-client policy, confirmation tokens, the call log
+  response.ts           JSON payload resolution, minification, `select`, shape inference
   compact-schema.ts     Compact input schemas for search results
   nexus-server.ts       MCP server — tool definitions and request handling
   sources/
     http-source.ts      HTTP transport client (Streamable HTTP)
     stdio-source.ts     Stdio transport client (subprocess, JSON-RPC)
+    limits.ts           The upstream response size cap both transports enforce
   search/
-    index.ts            SearchEngine — strategy dispatch + fallback
+    index.ts            SearchEngine — strategy dispatch, fallback, status for /health
     types.ts            Search config, result, and provider interfaces
-    lexical-search.ts   Keyword matching (word-prefix scoring, stopwords dropped)
+    lexical-search.ts   Keyword matching (word-prefix scoring, stopwords dropped, variants)
     semantic-search.ts  Embedding similarity search
     hybrid-search.ts    Reciprocal-rank fusion of the two, exact-name pinning
+    redirects.ts        A service's own "use X instead" pointers between its tools
     providers/
       builtin.ts        Transformers.js (all-MiniLM-L6-v2, local)
       ollama.ts         Ollama embedding API (nomic-embed-text)
       openai.ts         OpenAI-compatible embedding API
+test/
+  pure.test.ts          The pure modules: namespacing, globs, select, shapes, compact schemas
+  gateway.test.ts       Config, authentication, policy, confirmation, validation, search
+  call-tool.test.ts     call_tool end to end: a real server and client, a stub upstream
+  stub-upstream.mjs     The stub: a stdio MCP server with one tool per behaviour under test
 ```
 
 ## Scripts
@@ -387,6 +483,7 @@ src/
 | `npm run dev`          | Run with hot reload via `tsx watch` |
 | `npm start`            | Run without watch                   |
 | `npm run build`        | Compile TypeScript to `dist/`       |
+| `npm test`             | Unit tests, and `call_tool` end to end against a stub upstream (`node:test`, no extra dependencies) |
 | `npm run docker:build` | Build Docker image                  |
 | `npm run docker:run`   | Run Docker container                |
 | `npm run eval`         | Search relevance eval against `eval/baseline.json` |

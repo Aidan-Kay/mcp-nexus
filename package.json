@@ -7,6 +7,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "build": "tsc",
+    "test": "tsx --test test/*.test.ts",
     "docker:build": "docker build -t mcp-nexus .",
     "docker:run": "docker run -d --name mcp-nexus -p 8050:8050 -v ./mcp-nexus.yaml:/app/mcp-nexus.yaml mcp-nexus",
     "eval": "tsx eval/run.ts",

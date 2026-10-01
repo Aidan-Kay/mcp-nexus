@@ -53,8 +53,11 @@ export interface ScoredResult {
   score: number;
 }
 
-/** Which match condition(s) a hybrid hit satisfied. */
-export type MatchKind = "semantic" | "lexical" | "both";
+/**
+ * Which match condition(s) a hybrid hit satisfied. `suggested`: none — it is listed
+ * because the hit before it says, in its description, to use this tool instead.
+ */
+export type MatchKind = "semantic" | "lexical" | "both" | "suggested";
 
 export interface SearchResultItem {
   name: string;
@@ -63,7 +66,19 @@ export interface SearchResultItem {
   matched?: MatchKind;
   /** Hybrid only: an exact tool-name query pins that tool first. */
   pinned?: true;
+  /** Hybrid only: the hit whose description recommends this tool instead of itself. */
+  suggestedBy?: string;
+  /**
+   * Semantic and hybrid: cosine similarity of the query to the tool, to two places.
+   * Comparable across hits and against the response's `minSimilarity`, so a caller
+   * can tell a close match from the best of a poor set. Absent when the tool had no
+   * positive similarity, or under lexical search.
+   */
+  similarity?: number;
 }
+
+/** Narrows a search to the tools one client may see. */
+export type ToolPredicate = (name: string) => boolean;
 
 export interface SearchResult {
   query: string;
@@ -79,6 +94,8 @@ export interface SearchResult {
   strategy: SearchType;
   /** True if semantic search failed and fell back to lexical */
   fellBackToLexical?: boolean;
+  /** Semantic and hybrid: the similarity a tool needs to count as a semantic match. */
+  minSimilarity?: number;
 }
 
 // ─── Tool Text Representation ────────────────────────────────────────────────

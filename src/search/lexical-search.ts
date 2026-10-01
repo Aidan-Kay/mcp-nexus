@@ -15,6 +15,24 @@ const STOPWORDS = new Set([
 ]);
 
 /**
+ * Verbs that mean "read me some records". Services disagree on which one they name
+ * their read tools with — ms365 says `list-todo-tasks`, Todoist `todoist_task_get`,
+ * Google `get_events` — while a person asks to "list my tasks" or "read my inbox"
+ * whichever service holds them. Without this, "list" was evidence for ms365's tools
+ * alone and Todoist's own read tool never cleared the name-hit bar for a match.
+ */
+const READ_VERBS = ["list", "get", "fetch", "retrieve", "show", "read"];
+
+/** Alternatives a query word also matches as, itself first. */
+function variants(word: string): string[] {
+  if (READ_VERBS.includes(word)) return READ_VERBS;
+  // A plural query word is cut to its singular, so "tasks" matches `task` as well as
+  // `tasks` — the prefix rule already covers the other direction.
+  if (word.length > 3 && word.endsWith("s") && !word.endsWith("ss")) return [word, word.slice(0, -1)];
+  return [word];
+}
+
+/**
  * Split text into lowercase words: on anything that is not a letter or digit, and
  * on camelCase boundaries, so "outlook__search-emails" and "searchEmails" both
  * yield "search" and "emails".
@@ -54,6 +72,8 @@ export interface LexicalAnalysis {
  * A query word matches a name or description word it is a prefix of, so "email"
  * finds "emails" and "creat" finds "create" — but never the middle of a word, which
  * is what let short words match almost everything when this was a substring test.
+ * It also matches through its variants (a plural's singular, another read verb) at
+ * half weight.
  */
 export function analyzeLexical(query: string, tools: Map<string, IndexedTool>, serviceId?: string): LexicalAnalysis {
   const all = words(query);
@@ -63,7 +83,14 @@ export function analyzeLexical(query: string, tools: Map<string, IndexedTool>, s
   const queryWords = [...new Set(meaningful.length > 0 ? meaningful : all)];
   if (queryWords.length === 0) return { matches: [], queryWordCount: 0 };
 
-  const matches = (word: string, haystack: string[]) => haystack.some((w) => w.startsWith(word));
+  // A word matched as itself scores in full; matched only through a variant, half. The
+  // variant makes the tool findable, and the exact word still decides between two that
+  // both are — "ebay orders" keeps ebay_get_orders above ebay_get_order.
+  const expanded = new Map(queryWords.map((word) => [word, variants(word)]));
+  const matchWeight = (word: string, haystack: string[]): number => {
+    if (haystack.some((w) => w.startsWith(word))) return 1;
+    return expanded.get(word)!.some((v) => v !== word && haystack.some((w) => w.startsWith(v))) ? 0.5 : 0;
+  };
 
   const scored: LexicalMatch[] = [];
 
@@ -78,9 +105,10 @@ export function analyzeLexical(query: string, tools: Map<string, IndexedTool>, s
     let nameHits = 0;
 
     for (const word of queryWords) {
-      if (matches(word, nameWords)) score += 2;
-      if (matches(word, descWords)) score += 1;
-      if (matches(word, nameHitWords)) nameHits++;
+      score += 2 * matchWeight(word, nameWords) + matchWeight(word, descWords);
+      // A variant counts in full here: this is evidence the tool is about the word,
+      // and "list my tasks" must find Todoist's `task_get` as a match at all.
+      if (matchWeight(word, nameHitWords) > 0) nameHits++;
     }
 
     if (score > 0) {

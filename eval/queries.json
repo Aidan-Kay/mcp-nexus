@@ -21,6 +21,8 @@
   { "kind": "natural", "query": "find a file in google drive", "expect": ["google-workspace__search_drive_files"] },
   { "kind": "natural", "query": "read values from a spreadsheet", "expect": ["google-workspace__read_sheet_values"] },
   { "kind": "natural", "query": "set an out of office reply", "expect": ["google-workspace__manage_out_of_office", "ms365__update-mailbox-settings"] },
+  { "kind": "natural", "query": "list my tasks due today", "expect": ["todoist__todoist_task_get"], "note": "review 28/09: ms365 To Do, Planner and a bulk-update write tool ranked above every Todoist read" },
+  { "kind": "natural", "query": "calendar events this week", "expect": ["ms365__get-calendar-view"], "note": "review 28/09: list-calendar-events, whose own tip says to use get-calendar-view, ranked instead and get-calendar-view did not appear" },
 
   { "kind": "exact", "query": "todoist_task_update", "expect": ["todoist__todoist_task_update"] },
   { "kind": "exact", "query": "plex_recently_added", "expect": ["plex__plex_recently_added"] },
@@ -35,6 +37,7 @@
   { "kind": "scoped", "query": "recently added", "serviceId": "plex", "expect": ["plex__plex_recently_added"] },
   { "kind": "scoped", "query": "delete a label", "serviceId": "todoist", "expect": ["todoist__todoist_label_delete"] },
   { "kind": "scoped", "query": "move an email to a folder", "serviceId": "ms365", "expect": ["ms365__move-mail-message"] },
+  { "kind": "scoped", "query": "get tasks filtered by due date", "serviceId": "todoist", "expect": ["todoist__todoist_task_get"], "note": "review 28/09: 4th, behind completed tasks, the activity log and reminders" },
 
   { "kind": "nonsense", "query": "book a flight to Paris", "expect": [] },
   { "kind": "nonsense", "query": "check the weather tomorrow", "expect": [] },

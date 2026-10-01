@@ -15,8 +15,9 @@ import { fileURLToPath } from "node:url";
 import { applyFilter } from "../glob-utils.js";
 import { DEFAULT_REQUEST_TIMEOUT_MS } from "../indexer.js";
 import { logger, sourceLogger } from "../logger.js";
-import type { ContentBlock } from "../projection.js";
+import type { ContentBlock } from "../response.js";
 import type { JsonRpcRequest, JsonRpcResponse, SourceConfig, UpstreamCallResult } from "../types.js";
+import { ResponseTooLarge, responseLimit } from "./limits.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -136,8 +137,21 @@ function sendJsonRpc(
 
     const req = requester(options, (res) => {
       const chunks: Buffer[] = [];
-      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      const limit = responseLimit();
+      let received = 0;
+      res.on("data", (chunk: Buffer) => {
+        received += chunk.length;
+        if (received > limit) {
+          // Destroying the request drops the socket, so the rest is never read; the
+          // keep-alive agent opens a fresh one for the next call.
+          req.destroy();
+          reject(new ResponseTooLarge(limit));
+          return;
+        }
+        chunks.push(chunk);
+      });
       res.on("end", () => {
+        if (received > limit) return;
         const raw = Buffer.concat(chunks).toString("utf-8");
         if (res.statusCode && res.statusCode >= 400) {
           reject(new Error(`HTTP ${res.statusCode}: ${raw.slice(0, 200)}`));
@@ -376,6 +390,9 @@ async function sendWithRetry(
       return { response, error: response.error.message };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      // The same request would bring back the same oversized response, and the session
+      // is fine — it was this one response that was refused.
+      if (err instanceof ResponseTooLarge) return { response: { jsonrpc: "2.0", id: "" }, error: msg };
       // Transient network error — retry once
       if (attempt === 1) {
         slog.info(`request failed (${msg}), retrying with fresh session...`);

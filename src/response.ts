@@ -1,11 +1,16 @@
 /**
- * Response shaping — content resolution, minification, projection and shape inference.
+ * Response shaping — content resolution, minification, `select` and shape inference.
  *
  * Upstream MCP servers return a CallToolResult whose payload is normally a JSON
  * document serialised into a text content block. Several of them pretty-print it,
  * which is pure width with no value to an LLM. These helpers resolve that payload,
- * strip the formatting, and optionally project it down to the fields a caller asked
- * for — all while leaving non-JSON blocks (prose errors, images, resources) alone.
+ * strip the formatting, and cut it down to the paths a caller passed in `select` —
+ * all while leaving non-JSON blocks (prose errors, images, resources) alone.
+ *
+ * Trimming happens only when the caller asks. A per-tool default trim configured on
+ * the source used to exist as well; it was removed because a caller could not see
+ * it, so a field it had trimmed away read as a field the service never returned.
+ * `select` and artefacts between them cover what it was for.
  */
 
 // ─── Content Blocks ──────────────────────────────────────────────────────────
@@ -70,7 +75,7 @@ export function minifyContent(content: ContentBlock[]): ContentBlock[] {
 /**
  * Return `content` with the JSON payload at `index` replaced by `data`, minified.
  * When `index` is -1 the payload came from structuredContent rather than a text
- * block, so the projected form is emitted as a fresh block.
+ * block, so the selected form is emitted as a fresh block.
  */
 export function replaceJsonBlock(content: ContentBlock[], index: number, data: unknown): ContentBlock[] {
   const text = JSON.stringify(data);
@@ -79,7 +84,7 @@ export function replaceJsonBlock(content: ContentBlock[], index: number, data: u
   return content.map((block, i) => (i === index ? { ...block, text } : block));
 }
 
-// ─── Path Projection ─────────────────────────────────────────────────────────
+// ─── Path Selection ──────────────────────────────────────────────────────────
 
 interface Segment {
   key: string;
@@ -101,7 +106,7 @@ function parsePath(path: string): Segment[] {
 
 /**
  * Extract one path from `src`, rebuilding the nesting it was found under so
- * projections merge cleanly. Returns matched:false when the path does not exist,
+ * several paths merge cleanly. Returns matched:false when the path does not exist,
  * which the caller surfaces rather than silently yielding an empty result.
  */
 function buildPath(src: unknown, segments: Segment[]): { matched: boolean; value: unknown } {
@@ -133,7 +138,7 @@ function buildPath(src: unknown, segments: Segment[]): { matched: boolean; value
   return { matched: true, value: segment.key === "" ? inner.value : { [segment.key]: inner.value } };
 }
 
-/** Deep-merge two projected fragments so multiple paths compose into one document. */
+/** Deep-merge two selected fragments so multiple paths compose into one document. */
 function merge(a: unknown, b: unknown): unknown {
   if (a === undefined) return b;
   if (b === undefined) return a;
@@ -153,10 +158,10 @@ function merge(a: unknown, b: unknown): unknown {
 }
 
 /**
- * Project `data` down to `paths`, preserving the original nesting.
+ * Cut `data` down to `paths`, preserving the original nesting.
  * Paths that match nothing are reported — a typo must not look like absent data.
  */
-export function project(data: unknown, paths: string[]): { result: unknown; unmatched: string[] } {
+export function selectPaths(data: unknown, paths: string[]): { result: unknown; unmatched: string[] } {
   let result: unknown;
   const unmatched: string[] = [];
 

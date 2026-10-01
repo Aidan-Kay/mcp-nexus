@@ -12,6 +12,14 @@
  * because refusing a call the upstream would have accepted is worse than the round
  * trip this saves. For the same reason formats are not checked — a "date-time" the
  * upstream parses leniently must not be refused here on a stricter reading.
+ *
+ * The one place it is stricter than the schema is unknown top-level arguments. Most
+ * upstreams leave `additionalProperties` unset, which JSON Schema reads as "anything
+ * goes", and the services then ignore keys they do not know. So a misspelt filter
+ * (`due_date` for `due_before`) reached Todoist, was dropped there, and every task
+ * came back — a wrong answer with nothing to say it was wrong. An argument the tool
+ * does not declare is refused here whatever the schema says; a source whose tools
+ * really do take extra keys sets `allowUnknownArguments`.
  */
 
 import { Ajv, type ErrorObject, type ValidateFunction } from "ajv";
@@ -57,13 +65,91 @@ function describe(error: ErrorObject): string {
   }
 }
 
+/** Edit distance, for suggesting the argument a misspelt one was probably meant to be. */
+function distance(a: string, b: string): number {
+  const row = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    let diagonal = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const above = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diagonal = above;
+    }
+  }
+  return row[b.length];
+}
+
+/**
+ * The declared argument closest to `name`, when one is close enough to be a typo of it
+ * or shares its first word (`due_date` → `due_before`). Undefined when nothing is.
+ */
+function nearest(name: string, declared: string[]): string | undefined {
+  const lowered = name.toLowerCase();
+  const stem = name.split(/[_\-.]|(?=[A-Z])/)[0].toLowerCase();
+  let best: { name: string; score: number } | undefined;
+  for (const candidate of declared) {
+    const d = distance(lowered, candidate.toLowerCase());
+    const sharesStem = stem.length >= 3 && candidate.toLowerCase().startsWith(stem);
+    const close = d <= Math.max(1, Math.floor(name.length / 4));
+    if (!close && !sharesStem) continue;
+    if (!best || d < best.score) best = { name: candidate, score: d };
+  }
+  return best?.name;
+}
+
+/**
+ * Whether the schema declares, in its own words, that it takes keys it does not name:
+ * a schema-valued `additionalProperties` or any `patternProperties`. That is a map, not
+ * an omission, and is left alone. `additionalProperties: true` is not counted — it is
+ * what a schema generator writes by default, and says nothing about the tool.
+ */
+function declaresOpenKeys(schema: Record<string, unknown>): boolean {
+  const extra = schema.additionalProperties;
+  return (typeof extra === "object" && extra !== null) || schema.patternProperties !== undefined;
+}
+
+/** Top-level arguments the schema does not declare, each with a suggestion when there is one. */
+function unknownArguments(schema: unknown, parameters: Record<string, unknown>): string[] {
+  if (!schema || typeof schema !== "object") return [];
+  const body = schema as Record<string, unknown>;
+  const properties = body.properties;
+  // No property list to check against: a free-form tool, or one whose schema is not
+  // an object schema at all. Guessing would refuse calls the upstream accepts.
+  if (!properties || typeof properties !== "object" || declaresOpenKeys(body)) return [];
+
+  const declared = Object.keys(properties);
+  return Object.keys(parameters)
+    .filter((key) => !declared.includes(key))
+    .map((key) => {
+      const suggestion = nearest(key, declared);
+      return `parameters: unknown argument '${key}'${suggestion ? ` - did you mean '${suggestion}'?` : ""}`;
+    });
+}
+
+export interface ValidationOptions {
+  /** Let undeclared top-level arguments through (`sources[].allowUnknownArguments`). */
+  allowUnknownArguments?: boolean;
+}
+
 /**
  * Check a call's arguments against the tool's input schema.
  * Returns the problems found, or an empty array when the arguments pass or the
  * schema cannot be used.
  */
-export function validateArguments(toolName: string, schema: unknown, parameters: Record<string, unknown>): string[] {
+export function validateArguments(
+  toolName: string,
+  schema: unknown,
+  parameters: Record<string, unknown>,
+  options: ValidationOptions = {},
+): string[] {
+  const unknown = options.allowUnknownArguments ? [] : unknownArguments(schema, parameters);
+
   const validate = validatorFor(toolName, schema);
-  if (!validate || validate(parameters)) return [];
-  return [...new Set((validate.errors ?? []).map(describe))];
+  const schemaProblems = !validate || validate(parameters) ? [] : (validate.errors ?? []).map(describe);
+
+  // A schema that sets additionalProperties: false reports the same key through Ajv;
+  // the version with a suggestion is the one kept.
+  const reported = new Set(unknown.map((line) => line.replace(/ - did you mean.*$/, "")));
+  return [...new Set([...unknown, ...schemaProblems.filter((line) => !reported.has(line))])];
 }

@@ -27,6 +27,10 @@ jobs:
       # The image's own build step is tsc, so this is the check that matters most.
       - run: npx tsc --noEmit
       - run: npx tsc --noEmit -p eval
+      - run: npx tsc --noEmit -p test
+
+      # Unit tests, and call_tool end to end against a stub stdio upstream.
+      - run: npm test
 
       # The relevance eval: search ranking against the committed corpus, failing on
       # any regression from eval/baseline.json. Semantic and hybrid need the local

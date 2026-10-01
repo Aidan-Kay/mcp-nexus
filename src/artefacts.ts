@@ -2,7 +2,8 @@
  * Artefacts — writing tool results to files instead of returning them.
  *
  * A wide response costs the same tokens whether an agent reads all of it or not.
- * When a caller passes an `artefacts` label to call_tool, the projected payload is
+ * When a caller passes an `artefacts` label to call_tool, the payload (after any
+ * `select`) is
  * written to a file under a run directory and only a receipt comes back — so the
  * data reaches no LLM context at all and is read instead by whatever executes code
  * against the same path (on firelink, Jupyter mounts the directory read-only).
@@ -15,7 +16,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, type Dirent } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { logger } from "./logger.js";
-import { inferShape } from "./projection.js";
+import { inferShape } from "./response.js";
 import type { ArtefactsConfig } from "./types.js";
 
 /** Run directories this module created — the only thing the prune is allowed to delete. */
@@ -88,7 +89,7 @@ function canonical(value: unknown): unknown {
  *
  * Deterministic on purpose: a retried page overwrites itself rather than leaving a
  * second copy for the aggregation to double-count. `select` is part of the digest
- * so two calls differing only in projection do not collide on one filename.
+ * so two calls differing only in what they selected do not collide on one filename.
  */
 function fileStem(toolName: string, parameters: Record<string, unknown>, select: string[] | undefined): string {
   const stem = toolName.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 60) || "tool";
@@ -187,8 +188,8 @@ export function countRecords(payload: unknown): { records?: number; recordPath?:
 /**
  * Write one artefact into `state`'s directory and describe it.
  *
- * `payload` is the projected JSON — what the caller would otherwise have received,
- * after any configured projection or explicit `select`. When the response carried no
+ * `payload` is the JSON the caller would otherwise have received, after any
+ * `select`. When the response carried no
  * JSON at all, `text` is written verbatim instead and there is nothing to count.
  *
  * Throws on any filesystem failure; the caller reports it rather than falling back
@@ -233,7 +234,7 @@ export function writeArtefact(
     ...(isJson ? countRecords(opts.payload) : {}),
   };
 
-  // The shape of the *file*, not of the upstream response — a projection removed
+  // The shape of the *file*, not of the upstream response — a `select` removed
   // fields that are in one and not the other, and code is about to be written
   // against the file. Reported once per tool per run: seven pages share a shape.
   if (isJson && !state.toolsSeen.has(opts.toolName)) {

@@ -1,7 +1,7 @@
 /** Core types for mcp-nexus */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import type { ContentBlock } from "./projection.js";
+import type { ContentBlock } from "./response.js";
 import type { SearchConfig } from "./search/types.js";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -18,9 +18,32 @@ export interface NexusConfig {
 
 export interface AuthConfig {
   enabled: boolean;
+  /** The shared token, from MCP_NEXUS_AUTH_TOKEN. Callers presenting it are the client `default`. */
   token: string;
+  /**
+   * Per-client tokens, from MCP_NEXUS_TOKEN_<NAME>, keyed by the lowercased name.
+   * Never read from the YAML: a token in a config file is one more copy of a secret.
+   */
+  clientTokens: Record<string, string>;
+  /** What each client may call, keyed by client name. A client without an entry may call anything. */
+  clients: Record<string, ClientPolicy>;
   /** When set, only these origins are echoed in CORS headers. Empty/unset = reflect any origin. */
   allowedOrigins?: string[];
+}
+
+/**
+ * One client's policy. Every pattern is a glob over namespaced tool names
+ * (`ebay__*`, `*__delete*`), so a service and a single tool are written the same way.
+ */
+export interface ClientPolicy {
+  /** When set, only matching tools are visible or callable. */
+  allow?: string[];
+  /** Matching tools are neither visible nor callable. Wins over `allow`. */
+  deny?: string[];
+  /** Matching tools need a confirmed second call (see `confirmDestructive`). */
+  confirm?: string[];
+  /** Also require confirmation for every tool its upstream annotates `destructiveHint: true`. */
+  confirmDestructive: boolean;
 }
 
 export interface ConnectorsConfig {
@@ -28,6 +51,8 @@ export interface ConnectorsConfig {
   httpReuseIdleTimeoutSeconds: number;
   /** Interval (seconds) between recovery probes for failed sources. 0 = disabled. */
   recoveryIntervalSeconds: number;
+  /** An upstream response larger than this is abandoned rather than buffered. */
+  maxResponseBytes: number;
 }
 
 export interface ArtefactsConfig {
@@ -63,12 +88,11 @@ export interface SourceConfig {
   /** Non-prefixed tool names (e.g. "get-task") to surface directly in tools/list */
   preloadedTools?: string[];
   /**
-   * Default response projections, keyed by non-prefixed tool name. Each value is a
-   * list of dotted paths (`inventoryItems[*].product.title`) that the response is
-   * trimmed to. Use this for tools that are always wider than callers need — a
-   * `select` argument on the call overrides it.
+   * Let arguments the tool's schema does not declare through to the upstream. Off by
+   * default: a misspelled filter that reaches the service is ignored there, and the
+   * caller gets every record back with nothing to say its filter never applied.
    */
-  projections?: Record<string, string[]>;
+  allowUnknownArguments?: boolean;
   /** Per-source request timeout in milliseconds (default: 15000) */
   requestTimeoutMs?: number;
 }

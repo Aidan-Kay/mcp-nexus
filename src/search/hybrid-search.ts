@@ -2,8 +2,9 @@
 
 import type { IndexedTool } from "../types.js";
 import { analyzeLexical } from "./lexical-search.js";
+import { applySuggestions } from "./redirects.js";
 import type { EmbeddingIndex } from "./semantic-search.js";
-import type { MatchKind, SearchResult, SearchResultItem } from "./types.js";
+import type { MatchKind, SearchResult, SearchResultItem, ToolPredicate } from "./types.js";
 
 /**
  * Reciprocal-rank-fusion constant. Ranks are damped rather than summed, so a tool
@@ -37,6 +38,8 @@ export interface HybridSearchOptions {
   minSimilarity: number;
   maxResults: number;
   serviceId?: string;
+  /** Only tools this accepts are ranked, counted or returned. */
+  visible?: ToolPredicate;
 }
 
 interface HybridCandidate {
@@ -46,6 +49,8 @@ interface HybridCandidate {
   matched: MatchKind;
   pinned: boolean;
   isMatch: boolean;
+  similarity?: number;
+  suggestedBy?: string;
 }
 
 /**
@@ -56,14 +61,16 @@ interface HybridCandidate {
  * match, and that rank still pulls it up when the semantic side also finds it.
  */
 export function hybridSearch(options: HybridSearchOptions): SearchResult {
-  const { query, tools, embeddingIndex, queryEmbedding, minSimilarity, maxResults, serviceId } = options;
+  const { query, tools, embeddingIndex, queryEmbedding, minSimilarity, maxResults, serviceId, visible } = options;
 
   // Semantic ranking. EmbeddingIndex.search drops non-positive similarity, so a tool
   // absent here has no semantic rank — and, since minSimilarity is above zero in any
-  // calibrated config, is also not a semantic match.
+  // calibrated config, is also not a semantic match. Ranks are taken among the visible
+  // tools only, so a client's view ranks the same as it would if the rest did not exist.
   const semanticRank = new Map<string, number>();
   const similarity = new Map<string, number>();
-  embeddingIndex.search(queryEmbedding, serviceId).forEach((hit, index) => {
+  const semanticHits = embeddingIndex.search(queryEmbedding, serviceId);
+  (visible ? semanticHits.filter((hit) => visible(hit.name)) : semanticHits).forEach((hit, index) => {
     semanticRank.set(hit.name, index + 1);
     similarity.set(hit.name, hit.score);
   });
@@ -73,7 +80,7 @@ export function hybridSearch(options: HybridSearchOptions): SearchResult {
   const lexical = analyzeLexical(query, tools, serviceId);
   const lexicalRank = new Map<string, number>();
   const nameHits = new Map<string, number>();
-  lexical.matches.forEach((hit, index) => {
+  (visible ? lexical.matches.filter((hit) => visible(hit.name)) : lexical.matches).forEach((hit, index) => {
     lexicalRank.set(hit.name, index + 1);
     nameHits.set(hit.name, hit.nameHits);
   });
@@ -87,6 +94,7 @@ export function hybridSearch(options: HybridSearchOptions): SearchResult {
 
   for (const [name, indexed] of tools) {
     if (serviceId && indexed.sourceId !== serviceId) continue;
+    if (visible && !visible(name)) continue;
 
     const bare = name.includes("__") ? name.slice(name.indexOf("__") + 2) : name;
     const pinned =
@@ -107,18 +115,29 @@ export function hybridSearch(options: HybridSearchOptions): SearchResult {
       matched: semanticMatch && lexicalMatch ? "both" : semanticMatch ? "semantic" : "lexical",
       pinned,
       isMatch: pinned || semanticMatch || lexicalMatch,
+      similarity: sim,
     });
   }
 
   candidates.sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.fused - a.fused || a.name.localeCompare(b.name));
 
-  const matches = candidates.filter((c) => c.isMatch);
+  // A tool brought in by another's "use X instead" was not a match on its own; it is
+  // one now, placed beside the tool that named it, and says so.
+  const byName = new Map(candidates.map((c) => [c.name, c]));
+  const matches = applySuggestions(
+    candidates.filter((c) => c.isMatch),
+    tools,
+    (name) => byName.has(name),
+    (name, suggestedBy) => ({ ...byName.get(name)!, suggestedBy }),
+  );
   const truncated = matches.length > maxResults;
   const results: SearchResultItem[] = matches.slice(0, maxResults).map((c) => ({
     name: c.name,
     serviceId: c.serviceId,
-    matched: c.matched,
+    matched: c.isMatch ? c.matched : "suggested",
     ...(c.pinned ? { pinned: true as const } : {}),
+    ...(c.suggestedBy ? { suggestedBy: c.suggestedBy } : {}),
+    ...(c.similarity !== undefined ? { similarity: round2(c.similarity) } : {}),
   }));
 
   return {
@@ -127,5 +146,11 @@ export function hybridSearch(options: HybridSearchOptions): SearchResult {
     totalMatches: matches.length,
     truncated: truncated || undefined,
     strategy: "hybrid",
+    minSimilarity,
   };
+}
+
+/** Two places: enough to compare hits, without implying precision the model does not have. */
+export function round2(n: number): number {
+  return Math.round(n * 100) / 100;
 }

@@ -5,18 +5,20 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js";
 import type { CallToolResult, Tool as McpTool } from "@modelcontextprotocol/sdk/types.js";
 import { DEFAULT_NEGOTIATED_PROTOCOL_VERSION, isInitializeRequest, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 
 import { readFileSync } from "node:fs";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { resolveRun, writeArtefact, type ArtefactResult } from "./artefacts.js";
+import { authenticate, ClientAccess, ConfirmationStore, logCall, type CallOutcome, type CallRecord } from "./gateway.js";
 import { updateSourceInIndex } from "./indexer.js";
 import { logger } from "./logger.js";
 import { namespaceTool, parseNamespacedName } from "./namespace.js";
-import { inferShape, minifyContent, project, relevantShape, replaceJsonBlock, resolveJsonBlock, textOf, type ContentBlock } from "./projection.js";
+import { inferShape, minifyContent, relevantShape, replaceJsonBlock, resolveJsonBlock, selectPaths, textOf, type ContentBlock } from "./response.js";
 import type { SearchEngine } from "./search/index.js";
 import type { IndexedTool, NexusConfig, NexusIndex, UpstreamCallResult } from "./types.js";
 import { validateArguments } from "./validation.js";
@@ -44,7 +46,30 @@ const MCP_PROTOCOL_VERSION = DEFAULT_NEGOTIATED_PROTOCOL_VERSION;
  * these inside it validates cleanly and is then forwarded upstream as if it were
  * a tool argument — see checkMisplacedArguments.
  */
-const NEXUS_CALL_ARGS = ["select", "artefacts", "toolName"] as const;
+const NEXUS_CALL_ARGS = ["select", "artefacts", "confirm", "toolName"] as const;
+
+/**
+ * How long shutdown waits for in-flight calls before closing sessions and letting the
+ * caller kill stdio children. Under Docker's default ten-second stop grace, so the
+ * drain finishes before SIGKILL rather than being cut off by it.
+ */
+const SHUTDOWN_DRAIN_MS = 8_000;
+
+/** call_tool's own options, as distinct from the upstream tool's parameters. */
+interface CallOptions {
+  select?: string[];
+  artefacts?: string;
+  confirm?: string;
+  /** Dispatched as a preloaded tool, which has no `confirm` argument to pass. */
+  preloaded?: boolean;
+}
+
+/** A call_tool result plus what the call log records about it. */
+interface CallOutcomeResult {
+  result: CallToolResult;
+  outcome: CallOutcome;
+  confirmed?: true;
+}
 
 /**
  * Sends a JSON-RPC error response with the mcp-protocol-version header.
@@ -114,6 +139,8 @@ function withProtocolVersionHeader(res: ServerResponse): ServerResponse {
 interface ClientSession {
   transport: StreamableHTTPServerTransport;
   mcpServer: McpServer;
+  /** The client that initialized the session; every later request must authenticate as it. */
+  access: ClientAccess;
 }
 
 export class NexusServer {
@@ -142,6 +169,10 @@ export class NexusServer {
    * following the SDK's own `simpleStreamableHttp` example.
    */
   private sessions = new Map<string, ClientSession>();
+  private confirmations = new ConfirmationStore();
+  /** POST requests whose response has not finished, so shutdown can let them complete. */
+  private inFlight = new Set<Promise<void>>();
+  private closing = false;
 
   constructor(config: NexusConfig, index: NexusIndex, searchEngine: SearchEngine) {
     this.config = config;
@@ -168,11 +199,14 @@ export class NexusServer {
    * and a source that was down at index time is named as such rather than
    * quietly reported as having no tools.
    */
-  private renderInstructions(): string {
-    const roster = Array.from(this.index.sources.values()).map((state) => {
+  private renderInstructions(access: ClientAccess): string {
+    // A service whose every tool this client is denied is left out altogether, rather
+    // than listed with nothing in it.
+    const roster = Array.from(this.index.sources.values()).flatMap((state) => {
       const { id, name, description } = state.config;
-      const detail = state.tools.length > 0 ? `${state.tools.length} tools` : "unavailable at session start";
-      return `- ${id} (${name}) — ${description} [${detail}]`;
+      if (state.tools.length === 0) return [`- ${id} (${name}) — ${description} [unavailable at session start]`];
+      const visible = this.visibleTools(id, access).length;
+      return visible > 0 ? [`- ${id} (${name}) — ${description} [${visible} tools]`] : [];
     });
 
     return [
@@ -187,6 +221,11 @@ export class NexusServer {
     ].join("\n");
   }
 
+  /** The tools of one source that a client may see. */
+  private visibleTools(sourceId: string, access: ClientAccess): IndexedTool[] {
+    return (this.index.toolsBySource.get(sourceId) ?? []).filter((t) => access.permits(t.namespacedName));
+  }
+
   /** Everything get_schemas knows about a tool — search_tools returns a compact subset. */
   private describeTool(name: string, indexed: IndexedTool) {
     return {
@@ -198,8 +237,11 @@ export class NexusServer {
     };
   }
 
-  /** Register the 6 nexus management tools with the given SDK McpServer instance */
-  private registerNexusTools(mcpServer: McpServer): void {
+  /**
+   * Register the 6 nexus management tools with the given SDK McpServer instance.
+   * Each session has its own server, so every handler here is bound to one client.
+   */
+  private registerNexusTools(mcpServer: McpServer, access: ClientAccess): void {
     // ─── browse_services ───────────────────────────────────────────────────
     mcpServer.registerTool(
       "browse_services",
@@ -208,14 +250,20 @@ export class NexusServer {
           "List all available MCP services in the nexus. Returns an array of service objects, each with id, name, and description. Use this first to discover what services are available.",
       },
       async () => {
-        const services = Array.from(this.index.sources.values()).map((state) => ({
-          id: state.config.id,
-          name: state.config.name,
-          description: state.config.description,
-          toolCount: state.tools.length,
-          status: state.lastError ? "unavailable" : "ok",
-          lastError: state.lastError ?? null,
-        }));
+        const services = Array.from(this.index.sources.values()).flatMap((state) => {
+          const toolCount = this.visibleTools(state.config.id, access).length;
+          if (state.tools.length > 0 && toolCount === 0) return [];
+          return [
+            {
+              id: state.config.id,
+              name: state.config.name,
+              description: state.config.description,
+              toolCount,
+              status: state.lastError ? "unavailable" : "ok",
+              lastError: state.lastError ?? null,
+            },
+          ];
+        });
         return { content: [{ type: "text", text: JSON.stringify(services) }] };
       },
     );
@@ -243,8 +291,7 @@ export class NexusServer {
           };
         }
 
-        const sourceTools = this.index.toolsBySource.get(serviceId);
-        const toolNames = sourceTools ? sourceTools.map((t) => t.namespacedName) : [];
+        const toolNames = this.visibleTools(serviceId, access).map((t) => t.namespacedName);
 
         return { content: [{ type: "text", text: JSON.stringify({ serviceId, tools: toolNames }) }] };
       },
@@ -257,15 +304,23 @@ export class NexusServer {
     // via config.
     const isSemantic = this.config.search.type === "semantic";
     const isHybrid = this.config.search.type === "hybrid";
+    // The opening sentence is the strategy's own; the rest is shared. The shared part
+    // used to open with a generic version of the same sentence, so every description
+    // said "Search for tools across all services" twice.
     const commonDescription =
-      "Search for tools across all services (or within a single service). Returns matching tools ranked by relevance, each with its description, inputSchema and — once the tool has been called — its responseShape. Structured arguments (nested objects, arrays of objects) are cut to their type and named in inputSchemaTrimmed: call get_schemas for those tools; any other hit can go straight to call_tool.";
+      "Returns matching tools ranked by relevance, each with its description, inputSchema and — once the tool has been called — its responseShape. Structured arguments (nested objects, arrays of objects) are cut to their type and named in inputSchemaTrimmed: call get_schemas for those tools; any other hit can go straight to call_tool.";
+    const similarityNote =
+      " Each hit's 'similarity' (0-1) is how close it is to the query in meaning; compare it with 'minSimilarity' in the response to tell a close match from the best of a poor set.";
     const searchDescription = isHybrid
       ? "Search for tools across all services (or within a single service) by meaning and by name. " +
         commonDescription +
-        " Each hit carries 'matched', saying whether it matched by meaning, by name, or both, and an exact tool name is pinned first. Only tools that match closely enough are returned, so an empty result means nothing matched: rephrase the query rather than assume the tool does not exist. Accepts both natural-language queries describing what you want to do (e.g. 'I want to send an email') and exact tool or parameter names (e.g. 'todoist_task_update', 'bidPercentage')."
+        " Each hit carries 'matched', saying whether it matched by meaning, by name, or both, and an exact tool name is pinned first." +
+        similarityNote +
+        " Only tools that match closely enough are returned, so an empty result means nothing matched: rephrase the query rather than assume the tool does not exist. Accepts both natural-language queries describing what you want to do (e.g. 'I want to send an email') and exact tool or parameter names (e.g. 'todoist_task_update', 'bidPercentage')."
       : isSemantic
         ? "Search for tools across all services (or within a single service) by semantic similarity. " +
           commonDescription +
+          similarityNote +
           " Only tools similar enough to count as a match are returned, so an empty result means nothing matched: rephrase the query rather than assume the tool does not exist. Use natural-language queries describing what you want to do (e.g. 'I want to send an email', 'find tools for managing my inbox')."
         : "Search for tools across all services (or within a single service) by keyword matching. " +
           commonDescription +
@@ -290,13 +345,13 @@ export class NexusServer {
           return { content: [{ type: "text", text: "Missing required parameter: query" }], isError: true };
         }
 
-        const { results, ...rest } = await this.searchEngine.search(query, serviceId);
+        const { results, ...rest } = await this.searchEngine.search(query, serviceId, (name) => access.permits(name));
         // Every hit carries enough to call it: the round trip between finding a tool and
         // calling it was the common case, not the exception. The schema is compacted so
         // a few Graph-sized entities cannot swamp a search; outputSchema is left to
         // get_schemas for the same reason. A hit whose tool left the index mid-search
         // (a re-index) is dropped rather than returned without the schema it promises.
-        const hits = results.flatMap(({ name, serviceId, matched, pinned }) => {
+        const hits = results.flatMap(({ name, serviceId, matched, pinned, similarity }) => {
           const indexed = this.index.tools.get(name);
           if (!indexed) return [];
           const { schema, trimmed } = compactSchema(indexed.tool.inputSchema);
@@ -306,6 +361,7 @@ export class NexusServer {
               serviceId,
               matched,
               pinned,
+              similarity,
               description: indexed.tool.description,
               inputSchema: schema,
               inputSchemaTrimmed: trimmed,
@@ -348,7 +404,7 @@ export class NexusServer {
 
         for (const name of toolNames) {
           const indexed = this.index.tools.get(name);
-          if (!indexed) {
+          if (!indexed || !access.permits(name)) {
             missing.push(name);
             continue;
           }
@@ -366,6 +422,12 @@ export class NexusServer {
     // agent on every session, so an unusable argument is a permanent context cost
     // and an invitation to call something that can only fail.
     const artefactsEnabled = Boolean(this.config.artefacts);
+    // `confirm` is advertised on the same principle, per client: only one whose policy
+    // can ask for a confirmation is shown the argument that answers it.
+    const confirmEnabled = access.confirms;
+    const ownArguments = ["'select'", ...(artefactsEnabled ? ["'artefacts'"] : []), ...(confirmEnabled ? ["'confirm'"] : [])];
+    const ownArgumentsText =
+      ownArguments.length === 1 ? `${ownArguments[0]} is` : `${ownArguments.slice(0, -1).join(", ")} and ${ownArguments.at(-1)} are`;
 
     mcpServer.registerTool(
       "call_tool",
@@ -374,6 +436,9 @@ export class NexusServer {
           "Call a tool on an upstream MCP service. Pass the namespaced tool name (e.g. 'todoist__get-task') and its parameters. The response is passed through from the upstream service. Use 'select' to trim wide responses down to the fields you need — get_schemas reports a 'responseShape' you can write those paths from." +
           (artefactsEnabled
             ? " For results too large to be worth reading — a full orders feed, a whole catalogue — pass 'artefacts' instead: the response is written to a file and you get back its path, size and record count rather than the data."
+            : "") +
+          (confirmEnabled
+            ? " Some tools need confirming: the first call is refused with a 'confirm' token. Tell the user what the call will do, and only once they agree repeat the identical call with that token as 'confirm'."
             : ""),
         inputSchema: {
           toolName: z.string().describe("The namespaced tool name to call (e.g. 'todoist__get-task')"),
@@ -392,15 +457,25 @@ export class NexusServer {
             .optional()
             .describe(
               "The upstream tool's own arguments, matching its input schema. Pass each value with its native JSON type (e.g. 25, not {\"value\": 25}). Only that tool's arguments belong here — " +
-                (artefactsEnabled ? "'select' and 'artefacts' are" : "'select' is") +
-                " passed alongside this object, not inside it.",
+                ownArgumentsText +
+                " passed alongside this object, not inside it. An argument the tool does not declare is refused rather than passed on.",
             ),
           select: z
             .array(z.string())
             .optional()
             .describe(
-              "Optional dotted paths to trim the response to — an argument of call_tool itself, passed alongside 'parameters' rather than inside it. For example ['total', 'inventoryItems[*].sku', 'inventoryItems[*].product.title']. '[*]' maps over an array. Nesting is preserved. A path that matches nothing is reported as an error rather than returned as absent data, so a typo cannot look like a missing field.",
+              "Optional dotted paths to trim the response to — an argument of call_tool itself, passed alongside 'parameters' rather than inside it. For example ['total', 'inventoryItems[*].sku', 'inventoryItems[*].product.title']. '[*]' maps over an array. Nesting is preserved. A path that matches nothing is reported as an error rather than returned as absent data, so a typo cannot look like a missing field. Ignored, with a note, when the tool returns plain text.",
             ),
+          ...(confirmEnabled
+            ? {
+                confirm: z
+                  .string()
+                  .optional()
+                  .describe(
+                    "The token from a 'confirmation required' refusal — an argument of call_tool itself, passed alongside 'parameters'. Valid once, for five minutes, and only for the identical call (same tool, same parameters). Pass it only after the user has agreed to the call.",
+                  ),
+              }
+            : {}),
           ...(artefactsEnabled
             ? {
                 artefacts: z
@@ -416,13 +491,14 @@ export class NexusServer {
         },
       },
       async (args) => {
-        const { toolName, parameters = {}, select, artefacts } = args as {
+        const { toolName, parameters = {}, select, artefacts, confirm } = args as {
           toolName: string;
           parameters?: Record<string, unknown>;
           select?: string[];
           artefacts?: string;
+          confirm?: string;
         };
-        return this.executeCallTool(toolName, parameters, select, artefacts);
+        return this.executeCallTool(access, toolName, parameters, { select, artefacts, confirm });
       },
     );
 
@@ -467,7 +543,7 @@ export class NexusServer {
    * raw-JSON-Schema support or changes `_registeredTools`, this method will
    * need updating. Pin the SDK version in package.json to avoid surprises.
    */
-  private installToolsListHandler(mcpServer: McpServer): void {
+  private installToolsListHandler(mcpServer: McpServer, access: ClientAccess): void {
     // Type for the SDK's internal registered tool structure
     type SdkRegisteredTool = {
       enabled: boolean;
@@ -520,7 +596,7 @@ export class NexusServer {
       const preloadedTools: McpTool[] = [];
       for (const name of this.preloadedToolNames) {
         const indexed = this.index.tools.get(name);
-        if (indexed) {
+        if (indexed && access.permits(name)) {
           preloadedTools.push({
             name,
             description: indexed.tool.description,
@@ -564,7 +640,7 @@ export class NexusServer {
 
     // Register preloaded tools on all active sessions
     for (const session of this.sessions.values()) {
-      this.registerPreloadedToolsOnServer(session.mcpServer, passthrough);
+      this.registerPreloadedToolsOnServer(session.mcpServer, passthrough, session.access);
     }
 
     if (this.preloadedToolNames.size > 0) {
@@ -595,17 +671,21 @@ export class NexusServer {
    * Register preloaded tools on a specific McpServer instance.
    * Called both during session creation and during resolvePreloadedTools.
    */
-  private registerPreloadedToolsOnServer(mcpServer: McpServer, passthrough: z.ZodObject<{}, "passthrough">): void {
+  private registerPreloadedToolsOnServer(mcpServer: McpServer, passthrough: z.ZodObject<{}, "passthrough">, access: ClientAccess): void {
     for (const namespaced of this.preloadedToolNames) {
       const indexed = this.index.tools.get(namespaced);
-      if (indexed) {
+      // Registered at most once per session: recovery re-runs resolvePreloadedTools
+      // against live sessions that already have them, and the SDK throws on a
+      // duplicate name.
+      const registered = (mcpServer as unknown as { _registeredTools: Record<string, unknown> })._registeredTools;
+      if (indexed && access.permits(namespaced) && !(namespaced in registered)) {
         mcpServer.registerTool(
           namespaced,
           {
             description: indexed.tool.description,
             inputSchema: passthrough,
           },
-          async (args) => this.executeCallTool(namespaced, args as Record<string, unknown>),
+          async (args) => this.executeCallTool(access, namespaced, args as Record<string, unknown>, { preloaded: true }),
         );
       }
     }
@@ -622,44 +702,69 @@ export class NexusServer {
     }
   }
 
-  /** Shared call_tool implementation — also used for preloaded tool dispatch */
+  /**
+   * Shared call_tool implementation — also used for preloaded tool dispatch.
+   *
+   * Every call, refused or not, leaves one line in the call log. Shutdown waits for it
+   * through the HTTP request carrying it (see createHttpServer), not here: the call
+   * finishing is not the response being written.
+   */
   private async executeCallTool(
+    access: ClientAccess,
     toolName: string,
     parameters: Record<string, unknown>,
-    select?: string[],
-    artefacts?: string,
+    options: CallOptions = {},
   ): Promise<CallToolResult> {
-    if (!toolName) {
-      return { content: [{ type: "text", text: "Missing required parameter: toolName" }], isError: true };
-    }
+    const started = Date.now();
+    const { result, outcome, confirmed } = await this.runCallTool(access, toolName, parameters, options);
+    const record: CallRecord = {
+      client: access.name,
+      tool: toolName,
+      outcome,
+      ms: Date.now() - started,
+      args: Object.keys(parameters).sort(),
+      ...(options.select?.length ? { select: options.select.length } : {}),
+      ...(options.artefacts ? { artefacts: options.artefacts } : {}),
+      ...(confirmed ? { confirmed } : {}),
+    };
+    logCall(record);
+    return result;
+  }
+
+  private async runCallTool(
+    access: ClientAccess,
+    toolName: string,
+    parameters: Record<string, unknown>,
+    options: CallOptions,
+  ): Promise<CallOutcomeResult> {
+    const { select, artefacts, confirm } = options;
+    const refuse = (outcome: CallOutcome, text: string): CallOutcomeResult => ({
+      result: { content: [{ type: "text", text }], isError: true },
+      outcome,
+    });
+
+    if (!toolName) return refuse("invalid_arguments", "Missing required parameter: toolName");
 
     const parsed = parseNamespacedName(toolName);
     if (!parsed) {
-      return {
-        content: [
-          { type: "text", text: `Invalid tool name format: ${toolName}. Expected format: <sourceId>__<toolName> (e.g. todoist__get-task)` },
-        ],
-        isError: true,
-      };
+      return refuse(
+        "not_found",
+        `Invalid tool name format: ${toolName}. Expected format: <sourceId>__<toolName> (e.g. todoist__get-task)`,
+      );
     }
 
     const source = this.index.sources.get(parsed.sourceId);
-    if (!source) {
-      return {
-        content: [{ type: "text", text: `Source not found: ${parsed.sourceId}. Has the nexus been indexed?` }],
-        isError: true,
-      };
-    }
+    if (!source) return refuse("not_found", `Source not found: ${parsed.sourceId}. Has the nexus been indexed?`);
 
     // Check the tool exists in our index
     const indexed = this.index.tools.get(toolName);
     if (!indexed) {
-      return {
-        content: [
-          { type: "text", text: `Tool '${toolName}' not found in nexus. Use browse_tools to see available tools for this service.` },
-        ],
-        isError: true,
-      };
+      return refuse("not_found", `Tool '${toolName}' not found in nexus. Use browse_tools to see available tools for this service.`);
+    }
+
+    // Policy first: a client refused a tool learns nothing about its arguments.
+    if (!access.permits(toolName)) {
+      return refuse("denied", `Tool '${toolName}' is not available to this client ('${access.name}'). Ask the user to do it, or to change the nexus policy.`);
     }
 
     // A nexus argument nested inside `parameters` is a caller mistake that would
@@ -667,38 +772,54 @@ export class NexusServer {
     const misplaced = this.checkMisplacedArguments(indexed.tool, parameters);
     if (misplaced.length > 0) {
       const example = misplaced[0] === "select" ? '["field"]' : '"value"';
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: `these are arguments of call_tool itself, not parameters of ${toolName}: ${misplaced.join(", ")}`,
-              misplaced,
-              hint: `move them out of 'parameters' and pass them alongside it — { "toolName": "${toolName}", "parameters": {...}, "${misplaced[0]}": ${example} }`,
-            }),
-          },
-        ],
-        isError: true,
-      };
+      return refuse(
+        "invalid_arguments",
+        JSON.stringify({
+          error: `these are arguments of call_tool itself, not parameters of ${toolName}: ${misplaced.join(", ")}`,
+          misplaced,
+          hint: `move them out of 'parameters' and pass them alongside it — { "toolName": "${toolName}", "parameters": {...}, "${misplaced[0]}": ${example} }`,
+        }),
+      );
     }
 
     // Refused here rather than upstream so the refusal can carry the schema — the
     // upstream's own error rarely does, and the fix is always to read it.
-    const invalid = validateArguments(toolName, indexed.tool.inputSchema, parameters);
+    const invalid = validateArguments(toolName, indexed.tool.inputSchema, parameters, {
+      allowUnknownArguments: source.config.allowUnknownArguments,
+    });
     if (invalid.length > 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: `arguments do not match the input schema of ${toolName}`,
-              problems: invalid,
-              inputSchema: indexed.tool.inputSchema,
-            }),
-          },
-        ],
-        isError: true,
-      };
+      return refuse(
+        "invalid_arguments",
+        JSON.stringify({
+          error: `arguments do not match the input schema of ${toolName}`,
+          problems: invalid,
+          inputSchema: indexed.tool.inputSchema,
+        }),
+      );
+    }
+
+    // Confirmation comes after validation, so a token is only ever issued for a call
+    // that would actually be sent — never for one that was going to be refused anyway.
+    const confirmation = access.confirmationReason(toolName, indexed.tool);
+    let confirmed: true | undefined;
+    if (confirmation) {
+      if (confirm && this.confirmations.redeem(confirm, access.name, toolName, parameters)) {
+        confirmed = true;
+      } else {
+        const token = this.confirmations.issue(access.name, toolName, parameters);
+        return refuse(
+          "confirmation_required",
+          JSON.stringify({
+            error: `confirmation required: ${confirmation}`,
+            confirm: token,
+            expiresInSeconds: 300,
+            ...(confirm ? { rejected: "the confirm token passed was expired, already used, or issued for a different call" } : {}),
+            hint: options.preloaded
+              ? `tell the user exactly what this call will do and wait for their go-ahead, then make it through call_tool: { "toolName": "${toolName}", "parameters": <the same parameters>, "confirm": "${token}" }`
+              : `tell the user exactly what this call will do and wait for their go-ahead, then repeat the identical call with "confirm": "${token}" alongside 'parameters'`,
+          }),
+        );
+      }
     }
 
     // Route to the right transport
@@ -721,15 +842,10 @@ export class NexusServer {
         await this.refreshSource(parsed.sourceId);
       }
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: result.error, source: parsed.sourceId, tool: toolName, staleSchemaRefreshed: isStaleSchema }),
-          },
-        ],
-        isError: true,
-      };
+      return refuse(
+        "transport_error",
+        JSON.stringify({ error: result.error, source: parsed.sourceId, tool: toolName, staleSchemaRefreshed: isStaleSchema }),
+      );
     }
 
     // Clear transport error state — the call reached the service (A3)
@@ -742,8 +858,14 @@ export class NexusServer {
     // into a successful-looking blob, so callers could not tell a result from an error.
     if (result.isError) {
       await this.refreshIfStaleSchema(parsed.sourceId, textOf(result.content));
-      return { content: minifyContent(result.content) as CallToolResult["content"], isError: true };
+      return { result: { content: minifyContent(result.content) as CallToolResult["content"], isError: true }, outcome: "tool_error" };
     }
+
+    const done = (callResult: CallToolResult): CallOutcomeResult => ({
+      result: callResult,
+      outcome: callResult.isError ? "artefact_error" : "ok",
+      confirmed,
+    });
 
     // Resolve the JSON payload once — structuredContent when the service declares an
     // outputSchema, otherwise the first text block that parses as JSON.
@@ -754,92 +876,54 @@ export class NexusServer {
     // hand it to a caller that has not seen a response yet.
     if (payload !== undefined) this.responseShapes.set(toolName, inferShape(payload));
 
-    // An explicit select overrides the source's default projection for this tool.
-    //
-    // An empty array means "I am not selecting anything", not "select nothing" — it must
-    // fall through to the configured projection rather than past it. Treating it as a
-    // selection would let a caller silently opt out of a projection that exists to keep
-    // fields (buyer names, addresses) out of a response.
-    const requested = select && select.length > 0 ? select : undefined;
-    const paths = requested ?? source.config.projections?.[parsed.toolName];
-    const explicit = requested !== undefined;
+    // An empty array means "I am not selecting anything", not "select nothing".
+    const paths = select && select.length > 0 ? select : undefined;
+    const passthrough = minifyContent(result.content);
 
-    if (!paths || paths.length === 0 || payload === undefined) {
-      if (explicit && payload === undefined) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Cannot apply 'select' to ${toolName}: the response contains no JSON payload to project. Retry without 'select'.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-      const passthrough = minifyContent(result.content);
-      if (artefacts) {
-        return this.writeArtefactResult(artefacts, parsed.toolName, parameters, select, payload, passthrough, []);
-      }
-      return { content: passthrough as CallToolResult["content"], structuredContent: result.structuredContent };
+    if (!paths) {
+      if (artefacts) return done(this.writeArtefactResult(artefacts, parsed.toolName, parameters, select, payload, passthrough, []));
+      return done({ content: passthrough as CallToolResult["content"], structuredContent: result.structuredContent });
     }
 
-    const { result: projected, unmatched } = project(payload, paths);
+    // A text response has nothing to select from. It used to be refused after the call
+    // had run, so the result was thrown away and the caller had to make the call again
+    // — for Todoist, whose task tools all return text, on every call with a select.
+    // The text is returned as it came, with a note, since the call has already been made.
+    if (payload === undefined) {
+      const note = `'select' was ignored: ${toolName} returned text, not JSON, so there were no paths to select from. The full response is above.`;
+      if (artefacts) return done(this.writeArtefactResult(artefacts, parsed.toolName, parameters, select, payload, passthrough, [note]));
+      return done({ content: [...passthrough, { type: "text", text: `Note: ${note}` }] as CallToolResult["content"] });
+    }
+
+    const { result: selected, unmatched } = selectPaths(payload, paths);
 
     // A path that matches nothing is a caller error, not an empty result — returning
     // the trimmed data anyway would make a typo indistinguishable from absent data.
-    if (unmatched.length > 0 && explicit) {
+    if (unmatched.length > 0) {
       // Narrowed to the branch the failed paths were reaching into — the full shape of a
       // wide response can cost many times the response the caller was asking for.
       const { paths: shape, omitted } = relevantShape(this.responseShapes.get(toolName) ?? [], unmatched);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: `select paths matched nothing on ${toolName}`,
-              unmatched,
-              responseShape: shape,
-              responseShapeOmitted: omitted || undefined,
-              hint: omitted > 0 ? `call get_schemas for the full response shape of ${toolName}` : undefined,
-            }),
-          },
-        ],
-        isError: true,
-      };
+      return refuse(
+        "invalid_arguments",
+        JSON.stringify({
+          error: `select paths matched nothing on ${toolName}`,
+          unmatched,
+          responseShape: shape,
+          responseShapeOmitted: omitted || undefined,
+          hint: omitted > 0 ? `call get_schemas for the full response shape of ${toolName}` : undefined,
+        }),
+      );
     }
 
-    const content = replaceJsonBlock(result.content, result.structuredContent ? -1 : (jsonBlock?.index ?? -1), projected);
+    const content = replaceJsonBlock(result.content, result.structuredContent ? -1 : (jsonBlock?.index ?? -1), selected);
 
-    // A configured projection that has drifted warns rather than fails — the caller did
-    // not write it and cannot correct it mid-call.
-    //
-    // Optional fields are legitimately absent from most responses: a variations block on
-    // a non-variation listing, a discounted price on an unpromoted line item. Noting each
-    // miss in the response would put a warning on nearly every call and spend the context
-    // the projection just saved, so misses go to the log for whoever wrote the config.
-    // Only a projection that matched *nothing* is worth telling the caller about, because
-    // then the response it is holding is empty.
-    const notes: string[] = [];
-    if (unmatched.length > 0) {
-      logger.warn(`Projection for ${toolName} skipped unmatched paths: ${unmatched.join(", ")}`);
+    if (artefacts) return done(this.writeArtefactResult(artefacts, parsed.toolName, parameters, select, selected, content, []));
 
-      if (unmatched.length === paths.length) {
-        notes.push(`the configured projection for this tool matched nothing — none of these paths exist upstream: ${unmatched.join(", ")}`);
-        content.push({ type: "text", text: `Note: ${notes[0]}` });
-      }
-    }
-
-    if (artefacts) {
-      // The note travels with the receipt rather than the content, or a projection
-      // that has drifted would write an empty file and say nothing about it.
-      return this.writeArtefactResult(artefacts, parsed.toolName, parameters, select, projected, content, notes);
-    }
-
-    return {
+    return done({
       content: content as CallToolResult["content"],
-      structuredContent: result.structuredContent ? (projected as Record<string, unknown>) : undefined,
-    };
+      structuredContent: result.structuredContent ? (selected as Record<string, unknown>) : undefined,
+    });
   }
 
   /**
@@ -917,9 +1001,10 @@ export class NexusServer {
    *
    * `parameters` is an open record, so `{ parameters: { limit: 25, select: [...] } }`
    * validates and the stray key is forwarded upstream. The service then ignores it,
-   * and the caller believes a projection was applied that never reached the nexus at
+   * and the caller believes a selection was applied that never reached the nexus at
    * all — a wrong answer with nothing to show it was wrong, which is the failure
-   * `select`'s unmatched-path error exists to prevent.
+   * `select`'s unmatched-path error exists to prevent. The unknown-argument check in
+   * validation would also refuse it, but this names the actual mistake.
    *
    * Checked against the upstream tool's declared properties rather than by name
    * alone, so a service with a genuine parameter called `select` still works. A tool
@@ -1021,30 +1106,43 @@ export class NexusServer {
         const sources = Array.from(this.index.sources.values());
         const available = sources.filter((s) => !s.lastError).length;
         const failed = this.index.failedSources.size;
+        // A search running lexically when it was configured to use meaning is degraded
+        // too: every query still answers, just worse, which nothing else would show.
+        const search = this.searchEngine.status();
+        const searchDegraded = search.semantic === "unavailable" || search.semantic === "failing";
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
-            status: failed === 0 ? "ok" : "degraded",
+            status: failed === 0 && !searchDegraded ? "ok" : "degraded",
             uptime: process.uptime(),
             sources: { total: sources.length, available, failed },
             failedSourceIds: failed > 0 ? Array.from(this.index.failedSources) : undefined,
             totalTools: this.index.tools.size,
+            search,
           }),
         );
         return;
       }
 
-      // Auth check (unless disabled)
-      if (this.config.auth.enabled) {
-        const authHeader = req.headers["authorization"] ?? "";
-        const expected = `Bearer ${this.config.auth.token}`;
-        const aBuf = Buffer.from(authHeader);
-        const bBuf = Buffer.from(expected);
-        const match = aBuf.length === bBuf.length && timingSafeEqual(aBuf, bBuf);
-        if (!match) {
-          sendJsonRpcError(res, 401, -32001, "Unauthorized");
+      // Auth check — also says which client this is (`anonymous` when auth is off)
+      const client = authenticate(req.headers["authorization"], this.config.auth);
+      if (client === null) {
+        sendJsonRpcError(res, 401, -32001, "Unauthorized");
+        return;
+      }
+
+      if (req.method === "POST") {
+        if (this.closing) {
+          sendJsonRpcError(res, 503, -32000, "mcp-nexus is shutting down; retry in a few seconds");
           return;
         }
+        // Tracked until the response is fully written, which is what shutdown has to
+        // wait for — a tool call returning is not its result reaching the client.
+        // GET streams are left out: they stay open by design and would hold every stop
+        // to the full drain timeout.
+        const finished = new Promise<void>((resolve) => res.once("close", () => resolve()));
+        this.inFlight.add(finished);
+        void finished.then(() => this.inFlight.delete(finished));
       }
 
       // Read and size-limit the request body for POST requests.
@@ -1089,7 +1187,7 @@ export class NexusServer {
       // JSON-RPC error envelopes natively. We only need to inject the
       // mcp-protocol-version *response* header via the wrapper.
       const wrapped = withProtocolVersionHeader(res);
-      await this.handleMcpRequest(req, wrapped, parsedBody);
+      await this.handleMcpRequest(req, wrapped, parsedBody, client);
     });
   }
 
@@ -1103,12 +1201,19 @@ export class NexusServer {
    * 2. If the request has no session ID and is an initialize request → create new session
    * 3. Otherwise → 400 error (no valid session)
    */
-  private async handleMcpRequest(req: IncomingMessage, res: ServerResponse, parsedBody: unknown): Promise<void> {
+  private async handleMcpRequest(req: IncomingMessage, res: ServerResponse, parsedBody: unknown, client: string): Promise<void> {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
     // Case 1: Existing session — reuse its transport
     if (sessionId && this.sessions.has(sessionId)) {
       const session = this.sessions.get(sessionId)!;
+      // The session's tools are bound to the client that opened it. Another client's
+      // valid token with this session's ID would otherwise call with that client's
+      // policy and be logged under its name.
+      if (session.access.name !== client) {
+        sendJsonRpcError(res, 403, -32001, "Forbidden: this session belongs to another client");
+        return;
+      }
       await session.transport.handleRequest(req, res, parsedBody);
       return;
     }
@@ -1123,7 +1228,7 @@ export class NexusServer {
           // This callback fires inside handleRequest, after the session ID has
           // been generated but before the response is sent — so we can safely
           // store the session for subsequent requests.
-          this.sessions.set(sid, { transport, mcpServer });
+          this.sessions.set(sid, { transport, mcpServer, access });
           logger.debug(`Session initialized: ${sid} (active sessions: ${this.sessions.size})`);
         },
       });
@@ -1141,16 +1246,17 @@ export class NexusServer {
       // Instructions are rendered here, not at startup: this runs inside the
       // initialize handler, so the roster reflects the index as it stands when
       // the client actually connects.
+      const access = ClientAccess.for(client, this.config.auth);
       const mcpServer = new McpServer(
         { name: "mcp-nexus", version: SERVER_VERSION },
-        { capabilities: { tools: { listChanged: true } }, instructions: this.renderInstructions() },
+        { capabilities: { tools: { listChanged: true } }, instructions: this.renderInstructions(access) },
       );
-      this.registerNexusTools(mcpServer);
-      this.installToolsListHandler(mcpServer);
+      this.registerNexusTools(mcpServer, access);
+      this.installToolsListHandler(mcpServer, access);
 
       // Register any preloaded tools that were resolved before this session
       if (this.preloadedToolNames.size > 0) {
-        this.registerPreloadedToolsOnServer(mcpServer, z.object({}).passthrough());
+        this.registerPreloadedToolsOnServer(mcpServer, z.object({}).passthrough(), access);
       }
 
       // Connect the transport to the McpServer BEFORE handling the request
@@ -1166,21 +1272,51 @@ export class NexusServer {
 
   // ─── Start / Shutdown ────────────────────────────────────────────────────
 
-  async start(): Promise<void> {
+  /**
+   * Start listening. Resolves with the bound port, which differs from the configured
+   * one only when that is 0 — how a test asks for any free port.
+   */
+  async start(): Promise<number> {
     // No transport to connect at startup — sessions are created on demand
     // when clients send initialize requests.
     return new Promise((resolve) => {
       this.httpServer.listen(this.config.port, () => {
-        logger.info(`mcp-nexus listening on port ${this.config.port}`);
-        logger.info(`  MCP endpoint: POST http://0.0.0.0:${this.config.port}/`);
-        logger.info(`  Health check: GET  http://0.0.0.0:${this.config.port}/health`);
-        resolve();
+        const port = (this.httpServer.address() as AddressInfo).port;
+        logger.info(`mcp-nexus listening on port ${port}`);
+        logger.info(`  MCP endpoint: POST http://0.0.0.0:${port}/`);
+        logger.info(`  Health check: GET  http://0.0.0.0:${port}/health`);
+        resolve(port);
       });
     });
   }
 
+  /**
+   * Stop taking calls, let the ones in flight finish, then close the sessions.
+   *
+   * The caller kills stdio children and pooled HTTP connections once this resolves.
+   * It used to do that while calls were still waiting on them, so a call in progress
+   * at a restart failed with "Subprocess exited" — after the upstream may already
+   * have acted on it. The drain is bounded so a hung upstream cannot hold up a stop.
+   */
   async shutdown(): Promise<void> {
     logger.info("Shutting down...");
+    this.closing = true;
+    // Stop accepting connections; idle keep-alive sockets would otherwise hold close() open.
+    const closed = new Promise<void>((resolve) => this.httpServer.close(() => resolve()));
+    this.httpServer.closeIdleConnections();
+
+    if (this.inFlight.size > 0) {
+      logger.info(`Waiting up to ${SHUTDOWN_DRAIN_MS / 1000}s for ${this.inFlight.size} request(s) in flight`);
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), SHUTDOWN_DRAIN_MS);
+      });
+      const drained = Promise.allSettled([...this.inFlight]).then(() => "drained" as const);
+      const outcome = await Promise.race([drained, timeout]);
+      clearTimeout(timer);
+      if (outcome === "timeout") logger.warn(`${this.inFlight.size} request(s) still running at shutdown - abandoning them`);
+    }
+
     // Close all active sessions
     for (const [sid, session] of this.sessions) {
       try {
@@ -1190,11 +1326,8 @@ export class NexusServer {
       }
       this.sessions.delete(sid);
     }
-    return new Promise((resolve) => {
-      this.httpServer.close(() => {
-        logger.info("HTTP server closed");
-        resolve();
-      });
-    });
+    this.httpServer.closeAllConnections();
+    await closed;
+    logger.info("HTTP server closed");
   }
 }

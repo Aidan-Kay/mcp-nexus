@@ -9,8 +9,9 @@ import { fileURLToPath } from "node:url";
 import { applyFilter } from "../glob-utils.js";
 import { DEFAULT_REQUEST_TIMEOUT_MS } from "../indexer.js";
 import { sourceLogger } from "../logger.js";
-import type { ContentBlock } from "../projection.js";
+import type { ContentBlock } from "../response.js";
 import type { JsonRpcRequest, JsonRpcResponse, SourceConfig, UpstreamCallResult } from "../types.js";
+import { ResponseTooLarge, responseLimit } from "./limits.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -97,6 +98,34 @@ function spawnProcess(config: SourceConfig): StdioSession {
   const pending = new Map<string, PendingRequest>();
   const rl = createInterface({ input: proc.stdout! });
 
+  // readline buffers a line until its newline arrives, however long it gets, so the
+  // cap is applied to the bytes since the last newline. Once one line is over it the
+  // stream cannot be resynchronised (which request the line answers is inside the
+  // part not yet read), so every pending request fails with the reason and the
+  // process is killed; the next call spawns a fresh one.
+  let lineBytes = 0;
+  proc.stdout!.on("data", (chunk: Buffer) => {
+    const limit = responseLimit();
+    const firstNewline = chunk.indexOf(10);
+    let over: boolean;
+    if (firstNewline < 0) {
+      lineBytes += chunk.length;
+      over = lineBytes > limit;
+    } else {
+      // The line in progress ends inside this chunk; a new one starts after the last newline.
+      over = lineBytes + firstNewline > limit;
+      lineBytes = chunk.length - chunk.lastIndexOf(10) - 1;
+    }
+    if (!over) return;
+    slog.warn(`response line passed ${limit} bytes - killing the process`);
+    for (const [, req] of pending) {
+      clearTimeout(req.timer);
+      req.reject(new ResponseTooLarge(limit));
+    }
+    pending.clear();
+    proc.kill();
+  });
+
   // Drain stderr to prevent pipe buffer from filling and hanging the child.
   // Logged at debug level since upstream servers may echo secrets/config here.
   proc.stderr!.on("data", (chunk: Buffer) => {
@@ -143,7 +172,10 @@ function spawnProcess(config: SourceConfig): StdioSession {
       req.reject(new Error(`Subprocess exited (code=${code})`));
     }
     pending.clear();
-    sessions.delete(config.id);
+    // Only if it is still this process's entry. A process killed and replaced (after an
+    // oversized response, say) exits after its successor is registered, and deleting
+    // by id alone would drop the successor — leaving it running and never killed.
+    if (sessions.get(config.id) === session) sessions.delete(config.id);
   });
 
   sessions.set(config.id, session);

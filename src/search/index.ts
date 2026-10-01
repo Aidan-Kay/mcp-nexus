@@ -2,21 +2,41 @@
 
 import { logger } from "../logger.js";
 import type { NexusIndex } from "../types.js";
-import { hybridSearch } from "./hybrid-search.js";
+import { hybridSearch, round2 } from "./hybrid-search.js";
 import { lexicalSearch } from "./lexical-search.js";
 import { EmbeddingIndex } from "./semantic-search.js";
-import type { EmbeddingProvider, ScoredResult, SearchConfig, SearchResult, SearchType } from "./types.js";
+import type { EmbeddingProvider, ScoredResult, SearchConfig, SearchResult, SearchType, ToolPredicate } from "./types.js";
+
+/** What /health reports about search: whether the configured strategy is the one running. */
+export interface SearchStatus {
+  /** The strategy in the config. */
+  configured: SearchType;
+  /**
+   * `ok` — running as configured. `unavailable` — the embedding provider never came up,
+   * so every search is lexical. `failing` — it came up, but the most recent query
+   * that needed it failed and was answered lexically.
+   */
+  semantic: "ok" | "unavailable" | "failing" | "not-configured";
+  /** Why, when semantic is not ok. */
+  error?: string;
+  /** When the most recent fallback to lexical happened (ISO). */
+  lastFallbackAt?: string;
+}
 
 /**
  * Unified search engine.
  *
- * - When type === "lexical": uses substring scoring only.
+ * - When type === "lexical": uses word-prefix scoring only.
  * - When type === "hybrid": fuses semantic and lexical rankings. If the embedding
  *   provider fails (network error, service down), falls back to lexical search and
  *   sets fellBackToLexical: true in the result.
  * - When type === "semantic": uses cosine similarity. If the embedding
  *   provider fails (network error, service down), falls back to lexical
  *   search and sets fellBackToLexical: true in the result.
+ *
+ * A fallback used to be visible only on the search result that suffered it, which
+ * the agent reads and the operator never sees. The engine now remembers it, and
+ * /health reports it.
  *
  * Never returns the full tool list as a fallback. If search returns zero
  * results, the LLM must retry with a different query.
@@ -26,6 +46,11 @@ export class SearchEngine {
   private index: NexusIndex;
   private provider?: EmbeddingProvider;
   private embeddingIndex?: EmbeddingIndex;
+  /** Set when the provider failed to start, so no query will ever reach it. */
+  private unavailableReason?: string;
+  /** The most recent query-time failure, cleared by the next query that succeeds. */
+  private lastFailure?: { at: number; error: string };
+  private lastFallbackAt?: number;
 
   constructor(config: SearchConfig, index: NexusIndex, provider?: EmbeddingProvider) {
     this.config = config;
@@ -48,50 +73,72 @@ export class SearchEngine {
     return this.provider;
   }
 
-  async search(query: string, serviceId?: string): Promise<SearchResult> {
+  /** Record that the provider never started, for /health. Searches fall back regardless. */
+  markUnavailable(reason: string): void {
+    this.unavailableReason = reason;
+  }
+
+  status(): SearchStatus {
+    const configured = this.config.type;
+    const lastFallbackAt = this.lastFallbackAt ? new Date(this.lastFallbackAt).toISOString() : undefined;
+    if (configured === "lexical") return { configured, semantic: "not-configured" };
+    if (this.unavailableReason || !this.provider || !this.embeddingIndex) {
+      return { configured, semantic: "unavailable", error: this.unavailableReason ?? "no embedding provider", lastFallbackAt };
+    }
+    if (this.lastFailure) return { configured, semantic: "failing", error: this.lastFailure.error, lastFallbackAt };
+    return { configured, semantic: "ok", lastFallbackAt };
+  }
+
+  /**
+   * Search the index. `visible` narrows it to the tools one client may see, before
+   * ranking and truncation, so a client's results are never padded out by — or cut
+   * short for — tools it could not call.
+   */
+  async search(query: string, serviceId?: string, visible?: ToolPredicate): Promise<SearchResult> {
     const max = this.config.maxResults;
+    const minSimilarity = this.config.semantic?.minSimilarity ?? 0;
 
     if (this.config.type === "lexical") {
-      return this.runLexical(query, serviceId, max, "lexical", false);
+      return this.runLexical(query, serviceId, max, "lexical", false, visible);
     }
+
+    if (!this.provider || !this.embeddingIndex) {
+      logger.warn(`${this.config.type} search configured but provider/index not available — falling back to lexical`);
+      return this.fallBack(query, serviceId, max, visible);
+    }
+
+    let queryEmbedding: Float32Array;
+    try {
+      queryEmbedding = await this.provider.embed(query);
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      logger.warn(`${this.config.type} search failed — falling back to lexical: ${error}`);
+      this.lastFailure = { at: Date.now(), error };
+      return this.fallBack(query, serviceId, max, visible);
+    }
+    this.lastFailure = undefined;
 
     if (this.config.type === "hybrid") {
-      if (!this.provider || !this.embeddingIndex) {
-        logger.warn("Hybrid search configured but provider/index not available — falling back to lexical");
-        return this.runLexical(query, serviceId, max, "hybrid", true);
-      }
-      try {
-        const queryEmbedding = await this.provider.embed(query);
-        return hybridSearch({
-          query,
-          tools: this.index.tools,
-          embeddingIndex: this.embeddingIndex,
-          queryEmbedding,
-          minSimilarity: this.config.semantic?.minSimilarity ?? 0,
-          maxResults: max,
-          serviceId,
-        });
-      } catch (err) {
-        logger.warn(`Hybrid search failed — falling back to lexical: ${err instanceof Error ? err.message : String(err)}`);
-        return this.runLexical(query, serviceId, max, "hybrid", true);
-      }
+      return hybridSearch({
+        query,
+        tools: this.index.tools,
+        embeddingIndex: this.embeddingIndex,
+        queryEmbedding,
+        minSimilarity,
+        maxResults: max,
+        serviceId,
+        visible,
+      });
     }
 
-    // Semantic search
-    if (!this.provider || !this.embeddingIndex) {
-      logger.warn("Semantic search configured but provider/index not available — falling back to lexical");
-      return this.runLexical(query, serviceId, max, "semantic", true);
-    }
+    const scored = this.embeddingIndex.search(queryEmbedding, serviceId);
+    const result = this.formatResult(query, visible ? scored.filter((s) => visible(s.name)) : scored, max, "semantic", false, minSimilarity);
+    return { ...result, minSimilarity };
+  }
 
-    try {
-      const queryEmbedding = await this.provider.embed(query);
-      const scored = this.embeddingIndex.search(queryEmbedding, serviceId);
-      const floor = this.config.semantic?.minSimilarity ?? 0;
-      return this.formatResult(query, scored, max, "semantic", false, floor);
-    } catch (err) {
-      logger.warn(`Semantic search failed — falling back to lexical: ${err instanceof Error ? err.message : String(err)}`);
-      return this.runLexical(query, serviceId, max, "semantic", true);
-    }
+  private fallBack(query: string, serviceId: string | undefined, max: number, visible?: ToolPredicate): SearchResult {
+    this.lastFallbackAt = Date.now();
+    return this.runLexical(query, serviceId, max, this.config.type, true, visible);
   }
 
   private runLexical(
@@ -100,9 +147,10 @@ export class SearchEngine {
     max: number,
     strategy: SearchType,
     fellBack: boolean,
+    visible?: ToolPredicate,
   ): SearchResult {
     const scored = lexicalSearch(query, this.index.tools, serviceId);
-    return this.formatResult(query, scored, max, strategy, fellBack);
+    return this.formatResult(query, visible ? scored.filter((s) => visible(s.name)) : scored, max, strategy, fellBack);
   }
 
   private formatResult(
@@ -111,14 +159,17 @@ export class SearchEngine {
     max: number,
     strategy: SearchType,
     fellBack: boolean,
-    matchFloor = 0,
+    matchFloor?: number,
   ): SearchResult {
     // The floor bounds both the count and the results: a tool below it is not a match,
     // so it is neither counted nor returned, and a query nothing resembles comes back
     // empty — which the caller reads as "rephrase" — rather than as five weak guesses.
-    const matches = scored.filter((s) => s.score >= matchFloor);
+    // Its presence also says the scores are similarities, worth showing to the caller.
+    const matches = matchFloor === undefined ? scored : scored.filter((s) => s.score >= matchFloor);
     const truncated = matches.length > max;
-    const results = matches.slice(0, max).map(({ name, serviceId }) => ({ name, serviceId }));
+    const results = matches
+      .slice(0, max)
+      .map(({ name, serviceId, score }) => ({ name, serviceId, ...(matchFloor !== undefined ? { similarity: round2(score) } : {}) }));
     const totalMatches = matches.length;
 
     return {
