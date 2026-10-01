@@ -49,7 +49,7 @@
  },
  "semantic": {
   "hitAtK": 0.806,
-  "mrr": 0.658,
+  "mrr": 0.656,
   "emptyOk": 1,
   "ranks": {
    "send an email": 2,
@@ -87,7 +87,7 @@
    "plex: recently added": 1,
    "todoist: delete a label": 1,
    "ms365: move an email to a folder": 1,
-   "todoist: get tasks filtered by due date": 3,
+   "todoist: get tasks filtered by due date": 4,
    "book a flight to Paris": 0,
    "check the weather tomorrow": 0,
    "order a pizza": 0,
